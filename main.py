@@ -7,8 +7,8 @@ Enter "help" below or click "Help" above for more information.
 ... from aiogram.fsm.context import FSMContext
 ... from aiogram.fsm.storage.memory import MemoryStorage
 ... from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-... 
-... TOKEN = "8304350198:AAF8hWMzi2IlPuAi3td0AM9O-DmrsjaI6vg"
+... import os 
+... TOKEN = os.getenv "8304350198:AAHqoOVDdHZVVz6xOBIg5kEs9SvvhCJlguE"
 ... 
 ... bot = Bot(token=TOKEN)
 ... dp = Dispatcher(storage=MemoryStorage())
@@ -159,3 +159,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
