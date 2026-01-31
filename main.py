@@ -223,7 +223,7 @@ async def start_cmd(msg: types.Message, state: FSMContext):
     await state.clear()
     supported = price_fetcher.get_supported_symbols()
     await msg.answer(
-        "<b>📊 Калькулятор позиции DeFi</b>\n"
+        "<b>📊 DeFi Risk calculator</b>\n"
         "<i>с автоматическим получением цен</i>\n\n"
         f"<b>Поддерживаемые монеты ({len(supported)}):</b>\n"
         f"{', '.join(supported[:8])}...\n\n"
@@ -621,3 +621,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n👋 До свидания!")
+
