@@ -11,11 +11,11 @@ from aiogram.fsm.strategy import FSMStrategy
 from decimal import Decimal, ROUND_DOWN
 
 # Получаем токен из переменных окружения
-TOKEN = ("8304350198:AAHqoOVDdHZVVz6xOBIg5kEs9SvvhCJlguE")
+TOKEN = ("BOT_TOKEN")
 
 if not TOKEN:
     raise ValueError(
-        "Не установлен токен бота. Установите переменную окружения 8304350198:AAHqoOVDdHZVVz6xOBIg5kEs9SvvhCJlguE")
+        "Не установлен токен бота. Установите переменную окружения BOT_TOKEN")
 
 bot = Bot(
     token=TOKEN,
@@ -480,3 +480,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n👋 Бот остановлен")
+
