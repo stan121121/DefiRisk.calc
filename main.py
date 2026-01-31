@@ -167,7 +167,7 @@ async def start_cmd(msg: types.Message, state: FSMContext):
     """Обработчик команды /start"""
     await state.clear()
     await msg.answer(
-        "<b>📊 Калькулятор позиции DeFi</b>\n\n"
+        "<b>📊 DeFi Risk calculator </b>\n\n"
         "Введите тикер залогового актива (например: ETH, SOL, BTC):"
     )
     await state.set_state(Calc.supply_ticker)
@@ -582,8 +582,7 @@ async def fallback_handler(msg: types.Message, state: FSMContext):
         await msg.answer(
             "👋 Привет! Я помогу рассчитать параметры вашей DeFi позиции.\n\n"
             "Используйте /start для начала расчета\n"
-            "Или /help для получения справки"
-        )
+                    )
 
 # ---------- ERROR HANDLING ----------
 @dp.error()
@@ -616,3 +615,4 @@ if __name__ == "__main__":
         print("=" * 50)
     except Exception as e:
         print(f"\n❌ Критическая ошибка: {e}")
+
