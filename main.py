@@ -1,14 +1,12 @@
 """
 =============================================================================
-DeFi Risk.calc - Финальная версия v2.1
+DeFi Position Calculator Bot - Версия 2.2
 =============================================================================
 
-Изменения v2.1:
-✅ Новый порядок ввода: Max LTV → LT → режим расчета
-✅ Цена ликвидации учитывает источник цены (ручной/авто)
-✅ В расчете показывается, какая цена была использована
-
-dev. by Taponni
+Изменения v2.2:
+✅ Интеграция CryptoRank API (приоритет над CoinGecko)
+✅ Выбор источника цены: CryptoRank / CoinGecko / Ручной ввод
+✅ Кнопки для выбора цены при наличии нескольких источников
 
 =============================================================================
 """
@@ -29,8 +27,83 @@ from datetime import datetime, timedelta
 from collections import deque
 
 # =============================================================================
-# PRICE FETCHER
+# CONFIGURATION
 # =============================================================================
+
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("❌ Не установлен токен бота! Создайте .env файл с BOT_TOKEN=ваш_токен")
+
+CRYPTORANK_API_KEY = os.getenv("CRYPTORANK_API_KEY", "")  # Опционально
+
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+dp = Dispatcher(storage=MemoryStorage(), fsm_strategy=FSMStrategy.USER_IN_CHAT)
+
+
+# =============================================================================
+# PRICE FETCHERS
+# =============================================================================
+
+class CryptoRankPriceFetcher:
+    """Price fetcher для CryptoRank API"""
+    
+    BASE_URL = "https://api.cryptorank.io/v2/currencies"
+    
+    def __init__(self, api_key: str = ""):
+        self._api_key = api_key
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._stats = {"total_requests": 0, "successful": 0, "failed": 0}
+    
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=15)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
+    
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+    
+    def is_available(self) -> bool:
+        """Проверяет, доступен ли API ключ"""
+        return bool(self._api_key)
+    
+    async def get_price_usd(self, symbol: str) -> Optional[float]:
+        """Получение цены в USD"""
+        if not self.is_available():
+            return None
+        
+        symbol = symbol.upper().strip()
+        self._stats["total_requests"] += 1
+        
+        headers = {"X-Api-Key": self._api_key}
+        params = {"symbols": symbol}
+        
+        try:
+            session = await self._get_session()
+            async with session.get(self.BASE_URL, headers=headers, params=params) as resp:
+                if resp.status != 200:
+                    self._stats["failed"] += 1
+                    return None
+                
+                data = await resp.json()
+                items = data.get("data", [])
+                
+                if not items:
+                    self._stats["failed"] += 1
+                    return None
+                
+                price = float(items[0]["values"]["USD"]["price"])
+                self._stats["successful"] += 1
+                return price
+        except Exception as e:
+            print(f"❌ CryptoRank ошибка для {symbol}: {e}")
+            self._stats["failed"] += 1
+            return None
+    
+    def get_stats(self) -> dict:
+        return self._stats
+
 
 class CoinGeckoPriceFetcher:
     """Price fetcher с кэшированием и rate limiting"""
@@ -147,7 +220,7 @@ class CoinGeckoPriceFetcher:
                     self._save_to_cache(symbol, price)
                 return price
         except Exception as e:
-            print(f"❌ Ошибка получения цены {symbol}: {e}")
+            print(f"❌ CoinGecko ошибка для {symbol}: {e}")
             return None
     
     @classmethod
@@ -159,22 +232,13 @@ class CoinGeckoPriceFetcher:
         return sorted(cls.COINGECKO_IDS.keys())
 
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-TOKEN = os.getenv("BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("❌ Не установлен токен бота! Создайте .env файл с BOT_TOKEN=ваш_токен")
-
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-dp = Dispatcher(storage=MemoryStorage(), fsm_strategy=FSMStrategy.USER_IN_CHAT)
-
-price_fetcher = CoinGeckoPriceFetcher(cache_ttl=300, max_requests_per_minute=5)
+# Инициализация price fetchers
+cryptorank_fetcher = CryptoRankPriceFetcher(api_key=CRYPTORANK_API_KEY)
+coingecko_fetcher = CoinGeckoPriceFetcher(cache_ttl=300, max_requests_per_minute=5)
 
 
 # =============================================================================
-# FSM STATES - НОВЫЙ ПОРЯДОК
+# FSM STATES
 # =============================================================================
 
 class Calc(StatesGroup):
@@ -182,10 +246,11 @@ class Calc(StatesGroup):
     supply_ticker = State()         # Тикер залога
     borrow_ticker = State()         # Тикер займа
     supply_amount = State()         # Количество залога
-    supply_price_manual = State()  # Ручной ввод цены залога
-    max_ltv = State()               # Maximum LTV (ПЕРВЫЙ параметр!)
-    lt = State()                    # Liquidation Threshold (ВТОРОЙ параметр!)
-    mode = State()                  # Режим расчета (ТРЕТИЙ!)
+    choose_price = State()          # Выбор источника цены (если несколько)
+    supply_price_manual = State()   # Ручной ввод цены залога
+    max_ltv = State()               # Maximum LTV
+    lt = State()                    # Liquidation Threshold
+    mode = State()                  # Режим расчета
     ltv = State()                   # LTV (если режим по LTV)
     borrow = State()                # Сумма займа (если режим по сумме)
 
@@ -193,6 +258,30 @@ class Calc(StatesGroup):
 # =============================================================================
 # KEYBOARDS
 # =============================================================================
+
+def price_choice_kb(cryptorank_price: Optional[float], coingecko_price: Optional[float]):
+    """Клавиатура выбора источника цены"""
+    buttons = []
+    
+    if cryptorank_price is not None:
+        buttons.append([InlineKeyboardButton(
+            text=f"✅ CryptoRank: ${cryptorank_price:.6f if cryptorank_price < 1 else cryptorank_price:,.2f}",
+            callback_data="price_cryptorank"
+        )])
+    
+    if coingecko_price is not None:
+        buttons.append([InlineKeyboardButton(
+            text=f"🦎 CoinGecko: ${coingecko_price:.6f if coingecko_price < 1 else coingecko_price:,.2f}",
+            callback_data="price_coingecko"
+        )])
+    
+    buttons.append([InlineKeyboardButton(
+        text="✏️ Ввести цену вручную",
+        callback_data="price_manual"
+    )])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 
 mode_kb = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="🔢 По LTV", callback_data="mode_ltv")],
@@ -248,10 +337,6 @@ def calculate_health_factor(collateral: float, lt: float, borrow: float) -> floa
 
 
 def calculate_liquidation_price(borrow: float, supply_amount: float, lt: float) -> float:
-    """
-    Рассчитывает цену ликвидации
-    При этой цене залога позиция будет ликвидирована
-    """
     denominator = supply_amount * lt
     if denominator <= 0:
         return 0
@@ -274,12 +359,14 @@ def build_result_message(data: dict, calculations: dict) -> str:
     status, emoji = get_position_status(calculations['hf'])
     price_source = data.get('supply_price_source', 'manual')
     
-    # Умное форматирование цены (больше знаков для маленьких цен)
+    # Умное форматирование цены
     price = calculations['price']
     if price >= 1:
         price_str = f"${price:,.2f}"
     elif price >= 0.01:
         price_str = f"${price:.4f}"
+    elif price >= 0.0001:
+        price_str = f"${price:.6f}"
     else:
         price_str = f"${price:.8f}"
     
@@ -293,10 +380,12 @@ def build_result_message(data: dict, calculations: dict) -> str:
         liq_price_str = f"${liq_price:.8f}"
     
     # Определяем, как показывать цену
-    if price_source == "auto":
-        price_display = f"{price_str} (CoinGecko)"
-    else:
-        price_display = f"{price_str} (ручной ввод)"
+    source_names = {
+        "cryptorank": "CryptoRank",
+        "coingecko": "CoinGecko",
+        "manual": "ручной ввод"
+    }
+    price_display = f"{price_str} ({source_names.get(price_source, 'API')})"
     
     result = (
         f"<b>{emoji} РАСЧЕТ ПОЗИЦИИ</b>\n"
@@ -321,7 +410,7 @@ def build_result_message(data: dict, calculations: dict) -> str:
         f"• Health Factor: <b>{format_number(calculations['hf'], 2)}</b>\n"
     )
     
-    # Цена ликвидации с указанием источника цены
+    # Цена ликвидации
     if price_source == "manual":
         result += (
             f"• Цена ликвидации: <b>{liq_price_str}</b>\n"
@@ -339,7 +428,6 @@ def build_result_message(data: dict, calculations: dict) -> str:
     
     for drop, scen_hf in calculations['scenarios']:
         new_price = calculations['price'] * (1 - drop / 100)
-        # Умное форматирование для цен сценариев
         if new_price >= 1:
             new_price_str = f"${new_price:,.2f}"
         elif new_price >= 0.01:
@@ -376,18 +464,18 @@ def build_result_message(data: dict, calculations: dict) -> str:
 async def start_cmd(msg: types.Message, state: FSMContext):
     """Начало работы"""
     await state.clear()
-    supported = price_fetcher.get_supported_symbols()
-    supported_preview = ", ".join(supported[:10])
+    
+    cryptorank_status = "✅" if cryptorank_fetcher.is_available() else "❌"
+    coingecko_count = len(coingecko_fetcher.get_supported_symbols())
     
     await msg.answer(
-        "🤖 <b>DeFi Risk.calc</b>\n"
+        "🤖 <b>DeFi Position Calculator v2.2</b>\n"
         "<i>Калькулятор кредитных позиций в DeFi</i>\n\n"
         
-        f"<b>💰 Автоматические цены ({len(supported)} монет):</b>\n"
-        f"{supported_preview}...\n\n"
-        
-        "💡 <b>Для любых других токенов:</b>\n"
-        "Можно ввести цену вручную\n\n"
+        f"<b>📡 Источники цен:</b>\n"
+        f"{cryptorank_status} CryptoRank API\n"
+        f"✅ CoinGecko API ({coingecko_count} монет)\n"
+        f"✅ Ручной ввод (любые токены)\n\n"
         
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Введите <b>тикер залогового актива</b>\n"
@@ -411,33 +499,43 @@ async def help_cmd(msg: types.Message):
         "<b>Команды:</b>\n"
         "/start - начать расчет\n"
         "/reset - сбросить расчет\n"
-        "/supported - список монет\n"
+        "/supported - список монет CoinGecko\n"
         "/stats - статистика API\n\n"
         
+        "<b>Источники цен (приоритет):</b>\n"
+        "1️⃣ CryptoRank API (если настроен)\n"
+        "2️⃣ CoinGecko API\n"
+        "3️⃣ Ручной ввод\n\n"
+        
         "<b>Порядок ввода:</b>\n"
-        "1️⃣ Тикер залога\n"
-        "2️⃣ Тикер займа\n"
-        "3️⃣ Количество залога\n"
-        "4️⃣ Цена (авто/ручная)\n"
-        "5️⃣ Maximum LTV\n"
-        "6️⃣ Liquidation Threshold\n"
-        "7️⃣ Режим расчета\n"
-        "8️⃣ LTV или сумма займа"
+        "1. Тикер залога\n"
+        "2. Тикер займа\n"
+        "3. Количество залога\n"
+        "4. Выбор цены (авто/ручная)\n"
+        "5. Maximum LTV\n"
+        "6. Liquidation Threshold\n"
+        "7. Режим расчета\n"
+        "8. LTV или сумма займа"
     )
 
 
 @dp.message(Command("supported"))
 async def supported_cmd(msg: types.Message):
     """Список поддерживаемых монет"""
-    supported = price_fetcher.get_supported_symbols()
+    supported = coingecko_fetcher.get_supported_symbols()
     cols = 4
     rows = []
     for i in range(0, len(supported), cols):
         row = " | ".join(f"<code>{coin}</code>" for coin in supported[i:i+cols])
         rows.append(row)
     
+    cryptorank_status = "настроен ✅" if cryptorank_fetcher.is_available() else "не настроен ❌"
+    
     await msg.answer(
-        f"<b>💎 Монеты с автоценами ({len(supported)})</b>\n\n"
+        f"<b>📡 Источники цен:</b>\n\n"
+        f"<b>CryptoRank API:</b> {cryptorank_status}\n"
+        f"(поддерживает большинство токенов)\n\n"
+        f"<b>CoinGecko API ({len(supported)} монет):</b>\n"
         + "\n".join(rows) + 
         "\n\n💡 <i>Для остальных - ручной ввод</i>"
     )
@@ -446,18 +544,25 @@ async def supported_cmd(msg: types.Message):
 @dp.message(Command("stats"))
 async def stats_cmd(msg: types.Message):
     """Статистика API"""
-    stats = price_fetcher.get_stats()
+    cg_stats = coingecko_fetcher.get_stats()
+    cr_stats = cryptorank_fetcher.get_stats()
+    
     await msg.answer(
         f"<b>📊 Статистика API</b>\n\n"
-        f"Запросов: {stats['total_requests']}\n"
-        f"API вызовов: {stats['api_calls']}\n"
-        f"Из кэша: {stats['cache_hits']}\n"
-        f"Процент кэша: {stats['cache_hit_rate']}"
+        f"<b>CoinGecko:</b>\n"
+        f"Запросов: {cg_stats['total_requests']}\n"
+        f"API вызовов: {cg_stats['api_calls']}\n"
+        f"Из кэша: {cg_stats['cache_hits']}\n"
+        f"Процент кэша: {cg_stats['cache_hit_rate']}\n\n"
+        f"<b>CryptoRank:</b>\n"
+        f"Запросов: {cr_stats['total_requests']}\n"
+        f"Успешных: {cr_stats['successful']}\n"
+        f"Ошибок: {cr_stats['failed']}"
     )
 
 
 # =============================================================================
-# STATE HANDLERS - НОВЫЙ ПОРЯДОК ВВОДА
+# STATE HANDLERS
 # =============================================================================
 
 @dp.message(Calc.supply_ticker)
@@ -469,11 +574,9 @@ async def process_supply_ticker(msg: types.Message, state: FSMContext):
         return
     
     await state.update_data(supply_ticker=ticker)
-    is_supported = price_fetcher.is_supported(ticker)
     
     await msg.answer(
-        f"✅ <b>Залоговый актив:</b> {ticker}\n"
-        f"{'🌐' if is_supported else '✍️'} Цена: {'автоматическая' if is_supported else 'ручной ввод'}\n\n"
+        f"✅ <b>Залоговый актив:</b> {ticker}\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Введите <b>тикер заимствуемого актива</b>"
     )
@@ -511,48 +614,95 @@ async def process_supply_amount(msg: types.Message, state: FSMContext):
     data = await state.get_data()
     ticker = data['supply_ticker']
     
-    # Получение цены
-    if price_fetcher.is_supported(ticker):
-        await msg.answer(f"✅ Количество: {value:.6f}\n\n⏳ Получаю цену {ticker}...")
-        
-        price = await price_fetcher.get_price_usd(ticker)
-        
-        if price is None:
-            await msg.answer(
-                f"❌ Не удалось получить цену автоматически\n\n"
-                f"Введите <b>цену {ticker}</b> в USD вручную:"
-            )
-            await state.set_state(Calc.supply_price_manual)
-            return
-        
-        await state.update_data(supply_price=price, supply_price_source="auto")
-        collateral_value = value * price
-        
-        # Умное форматирование цены
-        if price >= 1:
-            price_str = f"${price:,.2f}"
-        elif price >= 0.01:
-            price_str = f"${price:.4f}"
-        elif price >= 0.0001:
-            price_str = f"${price:.6f}"
-        else:
-            price_str = f"${price:.8f}"
-        
-        await msg.answer(
-            f"✅ Цена (CoinGecko): <b>{price_str}</b>\n"
-            f"💰 Стоимость залога: <b>{format_currency(collateral_value)}</b>\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Введите <b>Maximum LTV</b> в %\n"
-            "(например: 65)"
+    await msg.answer(f"✅ Количество: {value:.6f}\n\n⏳ Получаю цены {ticker}...")
+    
+    # Пытаемся получить цены из обоих источников
+    cryptorank_price = await cryptorank_fetcher.get_price_usd(ticker)
+    coingecko_price = await coingecko_fetcher.get_price_usd(ticker)
+    
+    # Если есть хотя бы одна цена - предлагаем выбор
+    if cryptorank_price is not None or coingecko_price is not None:
+        await state.update_data(
+            cryptorank_price=cryptorank_price,
+            coingecko_price=coingecko_price
         )
-        await state.set_state(Calc.max_ltv)
-    else:
+        
+        sources = []
+        if cryptorank_price:
+            sources.append(f"CryptoRank: ${cryptorank_price:.2f if cryptorank_price >= 1 else cryptorank_price:.6f}")
+        if coingecko_price:
+            sources.append(f"CoinGecko: ${coingecko_price:.2f if coingecko_price >= 1 else coingecko_price:.6f}")
+        
         await msg.answer(
-            f"✅ Количество: {value:.6f}\n\n"
+            f"💱 <b>Найдены цены {ticker}:</b>\n"
+            + "\n".join(f"• {s}" for s in sources) +
+            "\n\n<b>Выберите источник цены:</b>",
+            reply_markup=price_choice_kb(cryptorank_price, coingecko_price)
+        )
+        await state.set_state(Calc.choose_price)
+    else:
+        # Нет автоматических цен - запрашиваем ручной ввод
+        await msg.answer(
+            f"❌ Цена {ticker} не найдена в API\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"Введите <b>цену {ticker}</b> в USD"
+            f"Введите <b>цену {ticker}</b> в USD вручную:"
         )
         await state.set_state(Calc.supply_price_manual)
+
+
+@dp.callback_query(F.data.startswith("price_"))
+async def process_price_choice(cb: types.CallbackQuery, state: FSMContext):
+    """Обработка выбора источника цены"""
+    await cb.answer()
+    
+    data = await state.get_data()
+    choice = cb.data.split("_")[1]  # cryptorank, coingecko, manual
+    
+    if choice == "manual":
+        await cb.message.edit_text(
+            f"✏️ Введите цену <b>{data['supply_ticker']}</b> в USD вручную:"
+        )
+        await state.set_state(Calc.supply_price_manual)
+        return
+    
+    # Используем выбранную API цену
+    if choice == "cryptorank":
+        price = data.get('cryptorank_price')
+        source = "cryptorank"
+        source_name = "CryptoRank"
+    else:  # coingecko
+        price = data.get('coingecko_price')
+        source = "coingecko"
+        source_name = "CoinGecko"
+    
+    if price is None:
+        await cb.message.edit_text("❌ Ошибка получения цены. Введите вручную:")
+        await state.set_state(Calc.supply_price_manual)
+        return
+    
+    await state.update_data(supply_price=price, supply_price_source=source)
+    
+    supply_amount = data['supply_amount']
+    collateral_value = supply_amount * price
+    
+    # Умное форматирование
+    if price >= 1:
+        price_str = f"${price:,.2f}"
+    elif price >= 0.01:
+        price_str = f"${price:.4f}"
+    elif price >= 0.0001:
+        price_str = f"${price:.6f}"
+    else:
+        price_str = f"${price:.8f}"
+    
+    await cb.message.edit_text(
+        f"✅ Цена ({source_name}): <b>{price_str}</b>\n"
+        f"💰 Стоимость залога: <b>{format_currency(collateral_value)}</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Введите <b>Maximum LTV</b> в %\n"
+        "(например: 65)"
+    )
+    await state.set_state(Calc.max_ltv)
 
 
 @dp.message(Calc.supply_price_manual)
@@ -592,7 +742,7 @@ async def process_supply_price_manual(msg: types.Message, state: FSMContext):
 
 @dp.message(Calc.max_ltv)
 async def process_max_ltv(msg: types.Message, state: FSMContext):
-    """Maximum LTV - ПЕРВЫЙ параметр"""
+    """Maximum LTV"""
     valid, value, error = validate_number(msg.text, min_val=0, max_val=100)
     if not valid:
         await msg.answer(f"❌ {error}\n\nMax LTV должен быть 0-100%. Введите:")
@@ -619,7 +769,7 @@ async def process_max_ltv(msg: types.Message, state: FSMContext):
 
 @dp.message(Calc.lt)
 async def process_lt(msg: types.Message, state: FSMContext):
-    """Liquidation Threshold - ВТОРОЙ параметр"""
+    """Liquidation Threshold"""
     valid, value, error = validate_number(msg.text, min_val=0, max_val=100)
     if not valid:
         await msg.answer(f"❌ {error}\n\nLT должен быть 0-100%. Введите:")
@@ -628,7 +778,6 @@ async def process_lt(msg: types.Message, state: FSMContext):
     data = await state.get_data()
     max_ltv = data.get('max_ltv', 0) * 100
     
-    # Проверка: LT должен быть >= Max LTV
     if value < max_ltv:
         await msg.answer(
             f"❌ <b>Ошибка:</b> Liquidation Threshold ({value}%) должен быть "
@@ -650,7 +799,7 @@ async def process_lt(msg: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("mode_"))
 async def process_mode(cb: types.CallbackQuery, state: FSMContext):
-    """Режим расчета - ТРЕТИЙ выбор"""
+    """Режим расчета"""
     await cb.answer()
     mode = cb.data
     data = await state.get_data()
@@ -673,7 +822,6 @@ async def process_mode(cb: types.CallbackQuery, state: FSMContext):
         )
         await state.set_state(Calc.ltv)
     else:
-        # Рассчитываем максимально возможную сумму займа
         max_possible_borrow = collateral_value * max_ltv
         
         await cb.message.edit_text(
@@ -699,7 +847,6 @@ async def process_ltv(msg: types.Message, state: FSMContext):
     data = await state.get_data()
     max_ltv = data.get('max_ltv', 0) * 100
     
-    # Проверка: LTV должен быть <= Max LTV
     if value > max_ltv:
         await msg.answer(
             f"❌ <b>Ошибка:</b> LTV ({value}%) не может превышать "
@@ -709,8 +856,6 @@ async def process_ltv(msg: types.Message, state: FSMContext):
         return
     
     await state.update_data(ltv=value / 100)
-    
-    # Переходим к расчету
     await calculate_position(msg, state)
 
 
@@ -729,7 +874,6 @@ async def process_borrow(msg: types.Message, state: FSMContext):
     max_ltv = data.get('max_ltv', 0)
     max_borrow_allowed = collateral_value * max_ltv
     
-    # Проверка: займ не должен превышать максимально возможный
     if value > max_borrow_allowed:
         await msg.answer(
             f"❌ <b>Ошибка:</b> Сумма займа ({format_currency(value)}) превышает "
@@ -740,8 +884,6 @@ async def process_borrow(msg: types.Message, state: FSMContext):
         return
     
     await state.update_data(borrow=value)
-    
-    # Переходим к расчету
     await calculate_position(msg, state)
 
 
@@ -754,7 +896,6 @@ async def calculate_position(msg: types.Message, state: FSMContext):
     try:
         data = await state.get_data()
         
-        # Проверка данных
         required = ['supply_ticker', 'borrow_ticker', 'supply_amount', 
                    'supply_price', 'lt', 'max_ltv', 'mode']
         if not all(f in data for f in required):
@@ -770,7 +911,6 @@ async def calculate_position(msg: types.Message, state: FSMContext):
         
         collateral = supply_amt * price
         
-        # Расчет займа и LTV
         if mode == "mode_ltv":
             ltv = data.get('ltv')
             if ltv is None:
@@ -788,13 +928,11 @@ async def calculate_position(msg: types.Message, state: FSMContext):
         
         ltv_percent = ltv * 100
         
-        # Расчеты
         hf = calculate_health_factor(collateral, lt, borrow)
         liq_price = calculate_liquidation_price(borrow, supply_amt, lt)
         max_borrow = collateral * max_ltv
         buffer = ((price - liq_price) / price) * 100 if price > 0 else 0
         
-        # Сценарии
         scenarios = []
         for drop in [10, 20, 30]:
             new_price = price * (1 - drop / 100)
@@ -802,7 +940,6 @@ async def calculate_position(msg: types.Message, state: FSMContext):
             scen_hf = calculate_health_factor(new_coll, lt, borrow)
             scenarios.append((drop, scen_hf))
         
-        # Собираем результаты
         calculations = {
             'supply_amt': supply_amt,
             'price': price,
@@ -818,7 +955,6 @@ async def calculate_position(msg: types.Message, state: FSMContext):
             'scenarios': scenarios
         }
         
-        # Отправка результата
         result_message = build_result_message(data, calculations)
         
         await msg.answer("⏳ Формирую результаты...")
@@ -863,25 +999,32 @@ async def error_handler(event, exception):
 
 async def on_startup():
     print("\n" + "=" * 70)
-    print("🚀 DeFi Risk.calc v2.1")
+    print("🚀 DeFi Position Calculator Bot v2.2")
     print("=" * 70)
     
     bot_info = await bot.get_me()
     print(f"✅ Бот: @{bot_info.username}")
     
-    test_price = await price_fetcher.get_price_usd("BTC")
+    # Проверка CryptoRank
+    if cryptorank_fetcher.is_available():
+        print("✅ CryptoRank API настроен")
+    else:
+        print("⚠️  CryptoRank API не настроен (добавьте CRYPTORANK_API_KEY в .env)")
+    
+    # Проверка CoinGecko
+    test_price = await coingecko_fetcher.get_price_usd("BTC")
     if test_price:
         print(f"✅ CoinGecko работает (BTC: ${test_price:,.2f})")
-        print(f"✅ Автоцены: {len(price_fetcher.get_supported_symbols())} монет")
+        print(f"✅ CoinGecko: {len(coingecko_fetcher.get_supported_symbols())} монет")
     
-    print("✅ Новый порядок: Max LTV → LT → режим расчета")
     print("=" * 70)
     print("✅ БОТ ГОТОВ")
     print("=" * 70 + "\n")
 
 
 async def on_shutdown():
-    await price_fetcher.close()
+    await cryptorank_fetcher.close()
+    await coingecko_fetcher.close()
     await bot.session.close()
     print("\n👋 Бот остановлен")
 
