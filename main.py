@@ -1,5 +1,3 @@
-[file name]: main.py
-[file content begin]
 """
 =============================================================================
 DeFi Position Calculator Bot - Финальная версия v2.2
@@ -1081,4 +1079,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n👋 До свидания!")
-[file content end]
