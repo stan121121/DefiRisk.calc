@@ -1,13 +1,18 @@
 """
 =============================================================================
-DeFi Position Calculator Bot - Production v2.3
-Optimized for Railway deployment
+DeFi Position Calculator Bot - Версия 2.2
+=============================================================================
+
+Изменения v2.2:
+✅ Интеграция CryptoRank API (приоритет над CoinGecko)
+✅ Выбор источника цены: CryptoRank / CoinGecko / Ручной ввод
+✅ Кнопки для выбора цены при наличии нескольких источников
+
 =============================================================================
 """
 
 import asyncio
 import os
-import logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
@@ -22,44 +27,37 @@ from datetime import datetime, timedelta
 from collections import deque
 
 # =============================================================================
-# LOGGING SETUP
-# =============================================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# =============================================================================
 # CONFIGURATION
 # =============================================================================
 
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
-    raise ValueError("❌ BOT_TOKEN not set in environment variables")
+    raise ValueError("❌ Не установлен токен бота! Создайте .env файл с BOT_TOKEN=ваш_токен")
 
-CRYPTORANK_API_KEY = os.getenv("CRYPTORANK_API_KEY", "")
+CRYPTORANK_API_KEY = os.getenv("CRYPTORANK_API_KEY", "")  # Опционально
+
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+dp = Dispatcher(storage=MemoryStorage(), fsm_strategy=FSMStrategy.USER_IN_CHAT)
+
 
 # =============================================================================
 # PRICE FETCHERS
 # =============================================================================
 
 class CryptoRankPriceFetcher:
-    """CryptoRank API price fetcher"""
+    """Price fetcher для CryptoRank API"""
     
     BASE_URL = "https://api.cryptorank.io/v2/currencies"
     
     def __init__(self, api_key: str = ""):
         self._api_key = api_key
         self._session: Optional[aiohttp.ClientSession] = None
-        self._stats = {"total": 0, "success": 0, "fail": 0}
+        self._stats = {"total_requests": 0, "successful": 0, "failed": 0}
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
-            )
+            timeout = aiohttp.ClientTimeout(total=15)
+            self._session = aiohttp.ClientSession(timeout=timeout)
         return self._session
     
     async def close(self):
@@ -67,167 +65,218 @@ class CryptoRankPriceFetcher:
             await self._session.close()
     
     def is_available(self) -> bool:
+        """Проверяет, доступен ли API ключ"""
         return bool(self._api_key)
     
     async def get_price_usd(self, symbol: str) -> Optional[float]:
+        """Получение цены в USD"""
         if not self.is_available():
             return None
         
-        self._stats["total"] += 1
         symbol = symbol.upper().strip()
+        self._stats["total_requests"] += 1
+        
+        headers = {"X-Api-Key": self._api_key}
+        params = {"symbols": symbol}
         
         try:
             session = await self._get_session()
-            async with session.get(
-                self.BASE_URL,
-                headers={"X-Api-Key": self._api_key},
-                params={"symbols": symbol}
-            ) as resp:
+            async with session.get(self.BASE_URL, headers=headers, params=params) as resp:
                 if resp.status != 200:
-                    self._stats["fail"] += 1
-                    logger.warning(f"CryptoRank {symbol}: HTTP {resp.status}")
+                    self._stats["failed"] += 1
                     return None
                 
                 data = await resp.json()
                 items = data.get("data", [])
                 
                 if not items:
-                    self._stats["fail"] += 1
+                    self._stats["failed"] += 1
                     return None
                 
                 price = float(items[0]["values"]["USD"]["price"])
-                self._stats["success"] += 1
+                self._stats["successful"] += 1
                 return price
         except Exception as e:
-            self._stats["fail"] += 1
-            logger.error(f"CryptoRank {symbol} error: {e}")
+            print(f"❌ CryptoRank ошибка для {symbol}: {e}")
+            self._stats["failed"] += 1
             return None
+    
+    def get_stats(self) -> dict:
+        return self._stats
 
 
 class CoinGeckoPriceFetcher:
-    """CoinGecko API price fetcher with caching"""
+    """Price fetcher с кэшированием и rate limiting"""
     
     COINGECKO_IDS = {
-        "ETH": "ethereum", "BTC": "bitcoin", "SOL": "solana",
-        "USDC": "usd-coin", "USDT": "tether", "DAI": "dai",
-        "BUSD": "binance-usd", "BNB": "binancecoin", "ADA": "cardano",
-        "DOT": "polkadot", "AVAX": "avalanche-2", "MATIC": "matic-network",
-        "LINK": "chainlink", "UNI": "uniswap", "ATOM": "cosmos",
-        "XRP": "ripple", "LTC": "litecoin", "DOGE": "dogecoin",
-        "SHIB": "shiba-inu", "AAVE": "aave",
+        "ETH": "ethereum",
+        "BTC": "bitcoin",
+        "SOL": "solana",
+        "USDC": "usd-coin",
+        "USDT": "tether",
+        "DAI": "dai",
+        "BUSD": "binance-usd",
+        "BNB": "binancecoin",
+        "ADA": "cardano",
+        "DOT": "polkadot",
+        "AVAX": "avalanche-2",
+        "MATIC": "matic-network",
+        "LINK": "chainlink",
+        "UNI": "uniswap",
+        "ATOM": "cosmos",
+        "XRP": "ripple",
+        "LTC": "litecoin",
+        "DOGE": "dogecoin",
+        "SHIB": "shiba-inu",
+        "AAVE": "aave",
     }
     
     BASE_URL = "https://api.coingecko.com/api/v3"
     
-    def __init__(self, cache_ttl: int = 300):
+    def __init__(self, cache_ttl: int = 300, max_requests_per_minute: int = 5):
         self._cache: Dict[str, Tuple[float, datetime]] = {}
         self._cache_ttl = timedelta(seconds=cache_ttl)
         self._session: Optional[aiohttp.ClientSession] = None
-        self._stats = {"total": 0, "cache": 0, "api": 0}
+        self._max_requests_per_minute = max_requests_per_minute
+        self._request_times = deque(maxlen=max_requests_per_minute)
+        self._rate_limit_lock = asyncio.Lock()
+        self._stats = {"total_requests": 0, "cache_hits": 0, "api_calls": 0}
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
-            )
+            timeout = aiohttp.ClientTimeout(total=15)
+            self._session = aiohttp.ClientSession(timeout=timeout)
         return self._session
     
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
     
+    async def _wait_for_rate_limit(self):
+        async with self._rate_limit_lock:
+            now = datetime.now()
+            while self._request_times and (now - self._request_times[0]).total_seconds() > 60:
+                self._request_times.popleft()
+            if len(self._request_times) >= self._max_requests_per_minute:
+                oldest_request = self._request_times[0]
+                wait_time = 60 - (now - oldest_request).total_seconds()
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time + 0.5)
+            self._request_times.append(now)
+    
     def _get_from_cache(self, symbol: str) -> Optional[float]:
         if symbol in self._cache:
             price, timestamp = self._cache[symbol]
             if datetime.now() - timestamp < self._cache_ttl:
-                self._stats["cache"] += 1
+                self._stats["cache_hits"] += 1
                 return price
         return None
     
-    async def get_price_usd(self, symbol: str) -> Optional[float]:
+    def _save_to_cache(self, symbol: str, price: float):
+        self._cache[symbol] = (price, datetime.now())
+    
+    def get_stats(self) -> dict:
+        cache_hit_rate = (
+            self._stats["cache_hits"] / self._stats["total_requests"] * 100 
+            if self._stats["total_requests"] > 0 else 0
+        )
+        return {**self._stats, "cache_hit_rate": f"{cache_hit_rate:.1f}%", "cache_size": len(self._cache)}
+    
+    async def get_price_usd(self, symbol: str, use_cache: bool = True) -> Optional[float]:
         symbol = symbol.upper().strip()
-        self._stats["total"] += 1
+        self._stats["total_requests"] += 1
         
-        cached = self._get_from_cache(symbol)
-        if cached is not None:
-            return cached
+        if use_cache:
+            cached_price = self._get_from_cache(symbol)
+            if cached_price is not None:
+                return cached_price
         
         if symbol not in self.COINGECKO_IDS:
             return None
         
+        url = f"{self.BASE_URL}/simple/price"
+        params = {"ids": self.COINGECKO_IDS[symbol], "vs_currencies": "usd"}
+        
         try:
+            await self._wait_for_rate_limit()
             session = await self._get_session()
-            self._stats["api"] += 1
+            self._stats["api_calls"] += 1
             
-            async with session.get(
-                f"{self.BASE_URL}/simple/price",
-                params={"ids": self.COINGECKO_IDS[symbol], "vs_currencies": "usd"}
-            ) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
+            async with session.get(url, params=params) as response:
+                if response.status == 429:
+                    retry_after = int(response.headers.get('Retry-After', '60'))
+                    await asyncio.sleep(retry_after)
+                    return await self.get_price_usd(symbol, use_cache=False)
+                
+                response.raise_for_status()
+                data = await response.json()
                 
                 coin_id = self.COINGECKO_IDS[symbol]
                 if coin_id not in data or "usd" not in data[coin_id]:
                     return None
                 
                 price = data[coin_id]["usd"]
-                self._cache[symbol] = (price, datetime.now())
+                if use_cache:
+                    self._save_to_cache(symbol, price)
                 return price
         except Exception as e:
-            logger.error(f"CoinGecko {symbol} error: {e}")
+            print(f"❌ CoinGecko ошибка для {symbol}: {e}")
             return None
     
     @classmethod
     def is_supported(cls, symbol: str) -> bool:
         return symbol.upper().strip() in cls.COINGECKO_IDS
+    
+    @classmethod
+    def get_supported_symbols(cls) -> list:
+        return sorted(cls.COINGECKO_IDS.keys())
 
 
-# Initialize fetchers
-cryptorank = CryptoRankPriceFetcher(api_key=CRYPTORANK_API_KEY)
-coingecko = CoinGeckoPriceFetcher(cache_ttl=300)
+# Инициализация price fetchers
+cryptorank_fetcher = CryptoRankPriceFetcher(api_key=CRYPTORANK_API_KEY)
+coingecko_fetcher = CoinGeckoPriceFetcher(cache_ttl=300, max_requests_per_minute=5)
 
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-dp = Dispatcher(storage=MemoryStorage(), fsm_strategy=FSMStrategy.USER_IN_CHAT)
 
 # =============================================================================
 # FSM STATES
 # =============================================================================
 
 class Calc(StatesGroup):
-    supply_ticker = State()
-    borrow_ticker = State()
-    supply_amount = State()
-    choose_price = State()
-    supply_price_manual = State()
-    max_ltv = State()
-    lt = State()
-    mode = State()
-    ltv = State()
-    borrow = State()
+    """Состояния для расчета позиции"""
+    supply_ticker = State()         # Тикер залога
+    borrow_ticker = State()         # Тикер займа
+    supply_amount = State()         # Количество залога
+    choose_price = State()          # Выбор источника цены (если несколько)
+    supply_price_manual = State()   # Ручной ввод цены залога
+    max_ltv = State()               # Maximum LTV
+    lt = State()                    # Liquidation Threshold
+    mode = State()                  # Режим расчета
+    ltv = State()                   # LTV (если режим по LTV)
+    borrow = State()                # Сумма займа (если режим по сумме)
+
 
 # =============================================================================
 # KEYBOARDS
 # =============================================================================
 
-def price_choice_kb(cr_price: Optional[float], cg_price: Optional[float]):
+def price_choice_kb(cryptorank_price: Optional[float], coingecko_price: Optional[float]):
+    """Клавиатура выбора источника цены"""
     buttons = []
     
-    if cr_price is not None:
-        price_str = f"${cr_price:,.2f}" if cr_price >= 1 else f"${cr_price:.6f}"
+    if cryptorank_price is not None:
         buttons.append([InlineKeyboardButton(
-            text=f"✅ CryptoRank: {price_str}",
+            text=f"✅ CryptoRank: ${cryptorank_price:.6f if cryptorank_price < 1 else cryptorank_price:,.2f}",
             callback_data="price_cryptorank"
         )])
     
-    if cg_price is not None:
-        price_str = f"${cg_price:,.2f}" if cg_price >= 1 else f"${cg_price:.6f}"
+    if coingecko_price is not None:
         buttons.append([InlineKeyboardButton(
-            text=f"🦎 CoinGecko: {price_str}",
+            text=f"🦎 CoinGecko: ${coingecko_price:.6f if coingecko_price < 1 else coingecko_price:,.2f}",
             callback_data="price_coingecko"
         )])
     
     buttons.append([InlineKeyboardButton(
-        text="✏️ Ввести вручную",
+        text="✏️ Ввести цену вручную",
         callback_data="price_manual"
     )])
     
@@ -236,31 +285,33 @@ def price_choice_kb(cr_price: Optional[float], cg_price: Optional[float]):
 
 mode_kb = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="🔢 По LTV", callback_data="mode_ltv")],
-    [InlineKeyboardButton(text="💵 По сумме", callback_data="mode_borrow")]
+    [InlineKeyboardButton(text="💵 По сумме займа", callback_data="mode_borrow")]
 ])
 
+
 # =============================================================================
-# UTILITIES
+# HELPER FUNCTIONS
 # =============================================================================
 
 def validate_number(text: str, min_val: float = 0, max_val: Optional[float] = None) -> Tuple[bool, float, str]:
     try:
-        value = float(text.replace(",", ".").strip())
+        text = text.replace(",", ".").strip()
+        value = float(text)
         if value <= min_val:
-            return False, 0, f"Должно быть > {min_val}"
-        if max_val and value > max_val:
-            return False, 0, f"Должно быть ≤ {max_val}"
+            return False, 0, f"Значение должно быть больше {min_val}"
+        if max_val is not None and value > max_val:
+            return False, 0, f"Значение должно быть не больше {max_val}"
         return True, value, ""
-    except:
-        return False, 0, "Введите число"
+    except (ValueError, TypeError):
+        return False, 0, "Пожалуйста, введите корректное число"
 
 
-def validate_ticker(text: str) -> Tuple[bool, str, str]:
+def validate_ticker(text: str, max_length: int = 10) -> Tuple[bool, str, str]:
     ticker = text.upper().strip()
-    if len(ticker) > 10:
-        return False, "", "Макс. 10 символов"
+    if len(ticker) > max_length:
+        return False, "", f"Тикер слишком длинный (максимум {max_length} символов)"
     if not ticker.isalnum():
-        return False, "", "Только буквы/цифры"
+        return False, "", "Тикер должен содержать только буквы и цифры"
     return True, ticker, ""
 
 
@@ -269,321 +320,539 @@ def format_currency(value: float) -> str:
         return f"${value/1_000_000:.2f}M"
     elif value >= 1_000:
         return f"${value/1_000:.1f}K"
-    return f"${value:.2f}"
+    else:
+        return f"${value:.2f}"
 
 
-def format_price(price: float) -> str:
-    if price >= 1:
-        return f"${price:,.2f}"
-    elif price >= 0.01:
-        return f"${price:.4f}"
-    elif price >= 0.0001:
-        return f"${price:.6f}"
-    return f"${price:.8f}"
+def format_number(value: float, decimals: int = 2) -> str:
+    if value == float('inf'):
+        return "∞"
+    return f"{value:.{decimals}f}"
 
 
-def calc_hf(collateral: float, lt: float, borrow: float) -> float:
-    return (collateral * lt) / borrow if borrow > 0 else float('inf')
+def calculate_health_factor(collateral: float, lt: float, borrow: float) -> float:
+    if borrow <= 0:
+        return float('inf')
+    return (collateral * lt) / borrow
 
 
-def calc_liq_price(borrow: float, supply: float, lt: float) -> float:
-    return borrow / (supply * lt) if (supply * lt) > 0 else 0
+def calculate_liquidation_price(borrow: float, supply_amount: float, lt: float) -> float:
+    denominator = supply_amount * lt
+    if denominator <= 0:
+        return 0
+    return borrow / denominator
 
 
-def get_status(hf: float) -> Tuple[str, str]:
+def get_position_status(hf: float) -> Tuple[str, str]:
     if hf <= 1.0:
         return "🔴 ЛИКВИДАЦИЯ", "🔴"
     elif hf < 1.3:
-        return "🟡 РИСК", "🟡"
+        return "🟡 ВНИМАНИЕ", "🟡"
     elif hf < 2.0:
-        return "🟢 НОРМА", "🟢"
-    return "🔵 ОТЛИЧНО", "🔵"
+        return "🟢 БЕЗОПАСНО", "🟢"
+    else:
+        return "🔵 ОЧЕНЬ БЕЗОПАСНО", "🔵"
 
 
-def build_result(data: dict, calc: dict) -> str:
-    status, emoji = get_status(calc['hf'])
+def build_result_message(data: dict, calculations: dict) -> str:
+    """Формирует итоговое сообщение с результатами"""
+    status, emoji = get_position_status(calculations['hf'])
+    price_source = data.get('supply_price_source', 'manual')
     
-    sources = {
+    # Умное форматирование цены
+    price = calculations['price']
+    if price >= 1:
+        price_str = f"${price:,.2f}"
+    elif price >= 0.01:
+        price_str = f"${price:.4f}"
+    elif price >= 0.0001:
+        price_str = f"${price:.6f}"
+    else:
+        price_str = f"${price:.8f}"
+    
+    # Аналогично для цены ликвидации
+    liq_price = calculations['liq_price']
+    if liq_price >= 1:
+        liq_price_str = f"${liq_price:,.2f}"
+    elif liq_price >= 0.01:
+        liq_price_str = f"${liq_price:.4f}"
+    else:
+        liq_price_str = f"${liq_price:.8f}"
+    
+    # Определяем, как показывать цену
+    source_names = {
         "cryptorank": "CryptoRank",
         "coingecko": "CoinGecko",
-        "manual": "ручной"
+        "manual": "ручной ввод"
     }
-    source = sources.get(data.get('supply_price_source', 'manual'), 'API')
-    
-    price_str = format_price(calc['price'])
-    liq_str = format_price(calc['liq_price'])
+    price_display = f"{price_str} ({source_names.get(price_source, 'API')})"
     
     result = (
         f"<b>{emoji} РАСЧЕТ ПОЗИЦИИ</b>\n"
         f"Статус: <b>{status}</b>\n\n"
         
         f"<b>💎 ЗАЛОГ:</b>\n"
-        f"• {data['supply_ticker']}: {calc['supply_amt']:.6f}\n"
-        f"• Цена: {price_str} ({source})\n"
-        f"• Стоимость: <b>{format_currency(calc['collateral'])}</b>\n\n"
+        f"• Актив: <b>{data['supply_ticker']}</b>\n"
+        f"• Количество: {calculations['supply_amt']:.6f}\n"
+        f"• Цена: {price_display}\n"
+        f"• Стоимость: <b>{format_currency(calculations['collateral'])}</b>\n\n"
         
         f"<b>💰 ЗАЙМ:</b>\n"
-        f"• {data['borrow_ticker']}: <b>{format_currency(calc['borrow'])}</b>\n\n"
+        f"• Актив: <b>{data['borrow_ticker']}</b>\n"
+        f"• Сумма: <b>{format_currency(calculations['borrow'])}</b>\n\n"
         
         f"<b>⚙️ ПАРАМЕТРЫ:</b>\n"
-        f"• Max LTV: {calc['max_ltv_pct']}%\n"
-        f"• LT: {calc['lt']*100:.1f}%\n"
-        f"• Current LTV: <b>{calc['ltv_pct']:.2f}%</b>\n\n"
+        f"• Maximum LTV: {calculations['max_ltv_percent']}%\n"
+        f"• Liquidation Threshold: {calculations['lt']*100:.1f}%\n"
+        f"• Current LTV: <b>{calculations['ltv_percent']:.2f}%</b>\n\n"
         
         f"<b>📊 РИСКИ:</b>\n"
-        f"• HF: <b>{calc['hf']:.2f if calc['hf'] != float('inf') else '∞'}</b>\n"
-        f"• Ликвидация: <b>{liq_str}</b>\n"
+        f"• Health Factor: <b>{format_number(calculations['hf'], 2)}</b>\n"
     )
     
-    if data.get('supply_price_source') == 'manual':
-        result += f"  <i>(при цене {price_str})</i>\n"
+    # Цена ликвидации
+    if price_source == "manual":
+        result += (
+            f"• Цена ликвидации: <b>{liq_price_str}</b>\n"
+            f"  <i>(при ручной цене залога {price_str})</i>\n"
+        )
+    else:
+        result += f"• Цена ликвидации: <b>{liq_price_str}</b>\n"
     
     result += (
-        f"• Буфер: <b>{calc['buffer']:.1f}%</b>\n"
-        f"• Макс. займ: {format_currency(calc['max_borrow'])}\n\n"
+        f"• Буфер безопасности: <b>{calculations['buffer']:.1f}%</b>\n"
+        f"• Макс. возможный займ: {format_currency(calculations['max_borrow'])}\n\n"
         
-        f"<b>📉 СЦЕНАРИИ:</b>\n"
+        f"<b>📉 СЦЕНАРИИ (падение цены):</b>\n"
     )
     
-    for drop, hf in calc['scenarios']:
-        new_price = calc['price'] * (1 - drop / 100)
-        result += f"• -{drop}% ({format_price(new_price)}) → HF: {hf:.2f}\n"
+    for drop, scen_hf in calculations['scenarios']:
+        new_price = calculations['price'] * (1 - drop / 100)
+        if new_price >= 1:
+            new_price_str = f"${new_price:,.2f}"
+        elif new_price >= 0.01:
+            new_price_str = f"${new_price:.4f}"
+        else:
+            new_price_str = f"${new_price:.8f}"
+        result += f"• -{drop}% ({new_price_str}) → HF: {format_number(scen_hf, 2)}\n"
     
-    if calc['hf'] < 1.3:
+    # Рекомендации
+    if calculations['hf'] < 1.3:
         result += (
-            "\n<b>⚠️ ВНИМАНИЕ:</b>\n"
-            "• Увеличьте залог\n"
-            "• Уменьшите займ\n"
-            "• Следите за ценой"
+            "\n<b>⚠️ РЕКОМЕНДАЦИИ:</b>\n"
+            "• Увеличьте залог для повышения HF\n"
+            "• Уменьшите сумму займа\n"
+            "• Подготовьте средства для пополнения\n"
+            "• Установите алерты на изменение цены"
+        )
+    
+    # Уведомление о ручном вводе
+    if price_source == "manual":
+        result += (
+            f"\n\n💡 <i>Цена {data['supply_ticker']} введена вручную. "
+            f"При следующем расчете потребуется ввести заново.</i>"
         )
     
     return result
 
+
 # =============================================================================
-# HANDLERS
+# COMMAND HANDLERS
 # =============================================================================
 
 @dp.message(Command("start"))
 async def start_cmd(msg: types.Message, state: FSMContext):
+    """Начало работы"""
     await state.clear()
     
-    cr_status = "✅" if cryptorank.is_available() else "❌"
+    cryptorank_status = "✅" if cryptorank_fetcher.is_available() else "❌"
+    coingecko_count = len(coingecko_fetcher.get_supported_symbols())
     
     await msg.answer(
-        "🤖 <b>DeFi Calculator</b>\n\n"
-        f"<b>Источники цен:</b>\n"
-        f"{cr_status} CryptoRank\n"
-        f"✅ CoinGecko\n"
-        f"✅ Ручной ввод\n\n"
-        "Введите <b>тикер залога</b>:"
+        "🤖 <b>DeFi Position Calculator v2.2</b>\n"
+        "<i>Калькулятор кредитных позиций в DeFi</i>\n\n"
+        
+        f"<b>📡 Источники цен:</b>\n"
+        f"{cryptorank_status} CryptoRank API\n"
+        f"✅ CoinGecko API ({coingecko_count} монет)\n"
+        f"✅ Ручной ввод (любые токены)\n\n"
+        
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Введите <b>тикер залогового актива</b>\n"
+        "(например: ETH, BTC, SOL)"
     )
     await state.set_state(Calc.supply_ticker)
 
 
-@dp.message(Command("reset"))
+@dp.message(Command("reset", "cancel"))
 async def reset_cmd(msg: types.Message, state: FSMContext):
+    """Сброс расчета"""
     await state.clear()
-    await msg.answer("✅ Сброс. /start для нового расчета")
+    await msg.answer("✅ Расчет сброшен. Используйте /start для нового расчета")
 
+
+@dp.message(Command("help"))
+async def help_cmd(msg: types.Message):
+    """Справка"""
+    await msg.answer(
+        "<b>📖 Справка</b>\n\n"
+        "<b>Команды:</b>\n"
+        "/start - начать расчет\n"
+        "/reset - сбросить расчет\n"
+        "/supported - список монет CoinGecko\n"
+        "/stats - статистика API\n\n"
+        
+        "<b>Источники цен (приоритет):</b>\n"
+        "1️⃣ CryptoRank API (если настроен)\n"
+        "2️⃣ CoinGecko API\n"
+        "3️⃣ Ручной ввод\n\n"
+        
+        "<b>Порядок ввода:</b>\n"
+        "1. Тикер залога\n"
+        "2. Тикер займа\n"
+        "3. Количество залога\n"
+        "4. Выбор цены (авто/ручная)\n"
+        "5. Maximum LTV\n"
+        "6. Liquidation Threshold\n"
+        "7. Режим расчета\n"
+        "8. LTV или сумма займа"
+    )
+
+
+@dp.message(Command("supported"))
+async def supported_cmd(msg: types.Message):
+    """Список поддерживаемых монет"""
+    supported = coingecko_fetcher.get_supported_symbols()
+    cols = 4
+    rows = []
+    for i in range(0, len(supported), cols):
+        row = " | ".join(f"<code>{coin}</code>" for coin in supported[i:i+cols])
+        rows.append(row)
+    
+    cryptorank_status = "настроен ✅" if cryptorank_fetcher.is_available() else "не настроен ❌"
+    
+    await msg.answer(
+        f"<b>📡 Источники цен:</b>\n\n"
+        f"<b>CryptoRank API:</b> {cryptorank_status}\n"
+        f"(поддерживает большинство токенов)\n\n"
+        f"<b>CoinGecko API ({len(supported)} монет):</b>\n"
+        + "\n".join(rows) + 
+        "\n\n💡 <i>Для остальных - ручной ввод</i>"
+    )
+
+
+@dp.message(Command("stats"))
+async def stats_cmd(msg: types.Message):
+    """Статистика API"""
+    cg_stats = coingecko_fetcher.get_stats()
+    cr_stats = cryptorank_fetcher.get_stats()
+    
+    await msg.answer(
+        f"<b>📊 Статистика API</b>\n\n"
+        f"<b>CoinGecko:</b>\n"
+        f"Запросов: {cg_stats['total_requests']}\n"
+        f"API вызовов: {cg_stats['api_calls']}\n"
+        f"Из кэша: {cg_stats['cache_hits']}\n"
+        f"Процент кэша: {cg_stats['cache_hit_rate']}\n\n"
+        f"<b>CryptoRank:</b>\n"
+        f"Запросов: {cr_stats['total_requests']}\n"
+        f"Успешных: {cr_stats['successful']}\n"
+        f"Ошибок: {cr_stats['failed']}"
+    )
+
+
+# =============================================================================
+# STATE HANDLERS
+# =============================================================================
 
 @dp.message(Calc.supply_ticker)
 async def process_supply_ticker(msg: types.Message, state: FSMContext):
+    """Тикер залога"""
     valid, ticker, error = validate_ticker(msg.text)
     if not valid:
-        await msg.answer(f"❌ {error}")
+        await msg.answer(f"❌ {error}\n\nВведите корректный тикер:")
         return
     
     await state.update_data(supply_ticker=ticker)
-    await msg.answer(f"✅ Залог: <b>{ticker}</b>\n\nВведите тикер займа:")
+    
+    await msg.answer(
+        f"✅ <b>Залоговый актив:</b> {ticker}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Введите <b>тикер заимствуемого актива</b>"
+    )
     await state.set_state(Calc.borrow_ticker)
 
 
 @dp.message(Calc.borrow_ticker)
 async def process_borrow_ticker(msg: types.Message, state: FSMContext):
+    """Тикер займа"""
     valid, ticker, error = validate_ticker(msg.text)
     if not valid:
-        await msg.answer(f"❌ {error}")
+        await msg.answer(f"❌ {error}\n\nВведите корректный тикер:")
         return
     
     await state.update_data(borrow_ticker=ticker)
     data = await state.get_data()
-    await msg.answer(f"✅ Займ: <b>{ticker}</b>\n\nВведите количество {data['supply_ticker']}:")
+    
+    await msg.answer(
+        f"✅ <b>Заимствуемый актив:</b> {ticker}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"Введите <b>количество {data['supply_ticker']}</b>"
+    )
     await state.set_state(Calc.supply_amount)
 
 
 @dp.message(Calc.supply_amount)
 async def process_supply_amount(msg: types.Message, state: FSMContext):
+    """Количество залога"""
     valid, value, error = validate_number(msg.text, min_val=0.000001)
     if not valid:
-        await msg.answer(f"❌ {error}")
+        await msg.answer(f"❌ {error}\n\nВведите количество:")
         return
     
     await state.update_data(supply_amount=value)
     data = await state.get_data()
     ticker = data['supply_ticker']
     
-    await msg.answer(f"✅ Количество: {value:.6f}\n\n⏳ Получаю цены...")
+    await msg.answer(f"✅ Количество: {value:.6f}\n\n⏳ Получаю цены {ticker}...")
     
-    cr_price = await cryptorank.get_price_usd(ticker)
-    cg_price = await coingecko.get_price_usd(ticker)
+    # Пытаемся получить цены из обоих источников
+    cryptorank_price = await cryptorank_fetcher.get_price_usd(ticker)
+    coingecko_price = await coingecko_fetcher.get_price_usd(ticker)
     
-    if cr_price is not None or cg_price is not None:
-        await state.update_data(cryptorank_price=cr_price, coingecko_price=cg_price)
+    # Если есть хотя бы одна цена - предлагаем выбор
+    if cryptorank_price is not None or coingecko_price is not None:
+        await state.update_data(
+            cryptorank_price=cryptorank_price,
+            coingecko_price=coingecko_price
+        )
         
         sources = []
-        if cr_price:
-            sources.append(f"CryptoRank: {format_price(cr_price)}")
-        if cg_price:
-            sources.append(f"CoinGecko: {format_price(cg_price)}")
+        if cryptorank_price:
+            sources.append(f"CryptoRank: ${cryptorank_price:.2f if cryptorank_price >= 1 else cryptorank_price:.6f}")
+        if coingecko_price:
+            sources.append(f"CoinGecko: ${coingecko_price:.2f if coingecko_price >= 1 else coingecko_price:.6f}")
         
         await msg.answer(
-            f"💱 <b>Найдены цены {ticker}:</b>\n" +
-            "\n".join(f"• {s}" for s in sources) +
-            "\n\n<b>Выберите источник:</b>",
-            reply_markup=price_choice_kb(cr_price, cg_price)
+            f"💱 <b>Найдены цены {ticker}:</b>\n"
+            + "\n".join(f"• {s}" for s in sources) +
+            "\n\n<b>Выберите источник цены:</b>",
+            reply_markup=price_choice_kb(cryptorank_price, coingecko_price)
         )
         await state.set_state(Calc.choose_price)
     else:
-        await msg.answer(f"❌ Цена не найдена\n\nВведите цену {ticker} в USD:")
+        # Нет автоматических цен - запрашиваем ручной ввод
+        await msg.answer(
+            f"❌ Цена {ticker} не найдена в API\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"Введите <b>цену {ticker}</b> в USD вручную:"
+        )
         await state.set_state(Calc.supply_price_manual)
 
 
 @dp.callback_query(F.data.startswith("price_"))
 async def process_price_choice(cb: types.CallbackQuery, state: FSMContext):
+    """Обработка выбора источника цены"""
     await cb.answer()
     
     data = await state.get_data()
-    choice = cb.data.split("_")[1]
+    choice = cb.data.split("_")[1]  # cryptorank, coingecko, manual
     
     if choice == "manual":
-        await cb.message.edit_text(f"✏️ Введите цену {data['supply_ticker']} в USD:")
+        await cb.message.edit_text(
+            f"✏️ Введите цену <b>{data['supply_ticker']}</b> в USD вручную:"
+        )
         await state.set_state(Calc.supply_price_manual)
         return
     
+    # Используем выбранную API цену
     if choice == "cryptorank":
         price = data.get('cryptorank_price')
         source = "cryptorank"
-    else:
+        source_name = "CryptoRank"
+    else:  # coingecko
         price = data.get('coingecko_price')
         source = "coingecko"
+        source_name = "CoinGecko"
     
     if price is None:
-        await cb.message.edit_text("❌ Ошибка. Введите цену вручную:")
+        await cb.message.edit_text("❌ Ошибка получения цены. Введите вручную:")
         await state.set_state(Calc.supply_price_manual)
         return
     
     await state.update_data(supply_price=price, supply_price_source=source)
     
-    collateral = data['supply_amount'] * price
+    supply_amount = data['supply_amount']
+    collateral_value = supply_amount * price
+    
+    # Умное форматирование
+    if price >= 1:
+        price_str = f"${price:,.2f}"
+    elif price >= 0.01:
+        price_str = f"${price:.4f}"
+    elif price >= 0.0001:
+        price_str = f"${price:.6f}"
+    else:
+        price_str = f"${price:.8f}"
     
     await cb.message.edit_text(
-        f"✅ Цена: <b>{format_price(price)}</b>\n"
-        f"💰 Залог: <b>{format_currency(collateral)}</b>\n\n"
-        "Введите <b>Maximum LTV</b> в %:"
+        f"✅ Цена ({source_name}): <b>{price_str}</b>\n"
+        f"💰 Стоимость залога: <b>{format_currency(collateral_value)}</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Введите <b>Maximum LTV</b> в %\n"
+        "(например: 65)"
     )
     await state.set_state(Calc.max_ltv)
 
 
 @dp.message(Calc.supply_price_manual)
-async def process_manual_price(msg: types.Message, state: FSMContext):
+async def process_supply_price_manual(msg: types.Message, state: FSMContext):
+    """Ручной ввод цены"""
     valid, price, error = validate_number(msg.text, min_val=0.000001)
     if not valid:
-        await msg.answer(f"❌ {error}")
+        await msg.answer(f"❌ {error}\n\nВведите цену:")
         return
     
-    await state.update_data(supply_price=price, supply_price_source="manual")
     data = await state.get_data()
-    collateral = data['supply_amount'] * price
+    ticker = data['supply_ticker']
+    amount = data['supply_amount']
+    
+    await state.update_data(supply_price=price, supply_price_source="manual")
+    collateral_value = amount * price
+    
+    # Умное форматирование цены
+    if price >= 1:
+        price_str = f"${price:,.2f}"
+    elif price >= 0.01:
+        price_str = f"${price:.4f}"
+    elif price >= 0.0001:
+        price_str = f"${price:.6f}"
+    else:
+        price_str = f"${price:.8f}"
     
     await msg.answer(
-        f"✅ Цена: <b>{format_price(price)}</b>\n"
-        f"💰 Залог: <b>{format_currency(collateral)}</b>\n\n"
-        "Введите <b>Maximum LTV</b> в %:"
+        f"✅ Цена (ручной ввод): <b>{price_str}</b>\n"
+        f"💰 Стоимость залога: <b>{format_currency(collateral_value)}</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Введите <b>Maximum LTV</b> в %\n"
+        "(например: 65)"
     )
     await state.set_state(Calc.max_ltv)
 
 
 @dp.message(Calc.max_ltv)
 async def process_max_ltv(msg: types.Message, state: FSMContext):
+    """Maximum LTV"""
     valid, value, error = validate_number(msg.text, min_val=0, max_val=100)
     if not valid:
-        await msg.answer(f"❌ {error}")
+        await msg.answer(f"❌ {error}\n\nMax LTV должен быть 0-100%. Введите:")
         return
     
     await state.update_data(max_ltv=value / 100)
     
+    # Получаем данные для расчёта максимального займа
     data = await state.get_data()
-    collateral = data['supply_amount'] * data['supply_price']
-    max_borrow = collateral * (value / 100)
+    supply_amount = data.get('supply_amount', 0)
+    supply_price = data.get('supply_price', 0)
+    collateral_value = supply_amount * supply_price
+    max_possible_borrow = collateral_value * (value / 100)
     
     await msg.answer(
-        f"✅ <b>Max LTV: {value}%</b>\n"
-        f"💰 Макс. займ: <b>{format_currency(max_borrow)}</b>\n\n"
-        "Введите <b>Liquidation Threshold</b> в %:"
+        f"✅ <b>Maximum LTV: {value}%</b>\n"
+        f"💰 Макс. возможный займ: <b>{format_currency(max_possible_borrow)}</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Введите <b>Liquidation Threshold (LT)</b> в %\n"
+        "(например: 75)"
     )
     await state.set_state(Calc.lt)
 
 
 @dp.message(Calc.lt)
 async def process_lt(msg: types.Message, state: FSMContext):
+    """Liquidation Threshold"""
     valid, value, error = validate_number(msg.text, min_val=0, max_val=100)
     if not valid:
-        await msg.answer(f"❌ {error}")
+        await msg.answer(f"❌ {error}\n\nLT должен быть 0-100%. Введите:")
         return
     
     data = await state.get_data()
     max_ltv = data.get('max_ltv', 0) * 100
     
     if value < max_ltv:
-        await msg.answer(f"❌ LT ({value}%) < Max LTV ({max_ltv:.0f}%)")
+        await msg.answer(
+            f"❌ <b>Ошибка:</b> Liquidation Threshold ({value}%) должен быть "
+            f"больше или равен Maximum LTV ({max_ltv:.0f}%)\n\n"
+            "Введите корректное значение LT:"
+        )
         return
     
     await state.update_data(lt=value / 100)
-    await msg.answer(f"✅ <b>LT: {value}%</b>\n\nВыберите режим:", reply_markup=mode_kb)
+    
+    await msg.answer(
+        f"✅ <b>Liquidation Threshold: {value}%</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Выберите <b>режим расчета</b>:",
+        reply_markup=mode_kb
+    )
     await state.set_state(Calc.mode)
 
 
 @dp.callback_query(F.data.startswith("mode_"))
 async def process_mode(cb: types.CallbackQuery, state: FSMContext):
+    """Режим расчета"""
     await cb.answer()
-    
+    mode = cb.data
     data = await state.get_data()
-    collateral = data['supply_amount'] * data['supply_price']
-    max_ltv = data['max_ltv']
     
-    await state.update_data(mode=cb.data)
+    supply_amount = data.get('supply_amount', 0)
+    supply_price = data.get('supply_price', 0)
+    collateral_value = supply_amount * supply_price
+    max_ltv = data.get('max_ltv', 0)
     
-    if cb.data == "mode_ltv":
+    await state.update_data(mode=mode)
+    
+    if mode == "mode_ltv":
         await cb.message.edit_text(
-            f"<b>🔢 Режим: по LTV</b>\n\n"
-            f"Залог: {format_currency(collateral)}\n"
-            f"Max LTV: {max_ltv * 100:.0f}%\n\n"
-            "Введите <b>LTV</b> в %:"
+            f"<b>🔢 Режим: Расчет по LTV</b>\n\n"
+            f"Стоимость залога: {format_currency(collateral_value)}\n"
+            f"Maximum LTV: {max_ltv * 100:.0f}%\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Введите <b>LTV</b> в %\n"
+            "(например: 50)"
         )
         await state.set_state(Calc.ltv)
     else:
-        max_borrow = collateral * max_ltv
+        max_possible_borrow = collateral_value * max_ltv
+        
         await cb.message.edit_text(
-            f"<b>💵 Режим: по сумме</b>\n\n"
-            f"Залог: {format_currency(collateral)}\n"
-            f"Max займ: <b>{format_currency(max_borrow)}</b>\n\n"
-            "Введите сумму займа в USD:"
+            f"<b>💵 Режим: Расчет по сумме займа</b>\n\n"
+            f"Стоимость залога: {format_currency(collateral_value)}\n"
+            f"Maximum LTV: {max_ltv * 100:.0f}%\n"
+            f"<b>Макс. возможный займ: {format_currency(max_possible_borrow)}</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Введите <b>сумму займа</b> в USD\n"
+            f"(максимум: {format_currency(max_possible_borrow)})"
         )
         await state.set_state(Calc.borrow)
 
 
 @dp.message(Calc.ltv)
 async def process_ltv(msg: types.Message, state: FSMContext):
+    """LTV для расчета"""
     valid, value, error = validate_number(msg.text, min_val=0, max_val=100)
     if not valid:
-        await msg.answer(f"❌ {error}")
+        await msg.answer(f"❌ {error}\n\nLTV должен быть 0-100%. Введите:")
         return
     
     data = await state.get_data()
     max_ltv = data.get('max_ltv', 0) * 100
     
     if value > max_ltv:
-        await msg.answer(f"❌ LTV ({value}%) > Max LTV ({max_ltv:.0f}%)")
+        await msg.answer(
+            f"❌ <b>Ошибка:</b> LTV ({value}%) не может превышать "
+            f"Maximum LTV ({max_ltv:.0f}%)\n\n"
+            "Введите корректное значение:"
+        )
         return
     
     await state.update_data(ltv=value / 100)
@@ -592,114 +861,172 @@ async def process_ltv(msg: types.Message, state: FSMContext):
 
 @dp.message(Calc.borrow)
 async def process_borrow(msg: types.Message, state: FSMContext):
+    """Сумма займа"""
     valid, value, error = validate_number(msg.text, min_val=0)
     if not valid:
-        await msg.answer(f"❌ {error}")
+        await msg.answer(f"❌ {error}\n\nВведите сумму:")
         return
     
     data = await state.get_data()
-    collateral = data['supply_amount'] * data['supply_price']
-    max_borrow = collateral * data['max_ltv']
+    supply_amount = data.get('supply_amount', 0)
+    supply_price = data.get('supply_price', 0)
+    collateral_value = supply_amount * supply_price
+    max_ltv = data.get('max_ltv', 0)
+    max_borrow_allowed = collateral_value * max_ltv
     
-    if value > max_borrow:
-        await msg.answer(f"❌ {format_currency(value)} > макс. {format_currency(max_borrow)}")
+    if value > max_borrow_allowed:
+        await msg.answer(
+            f"❌ <b>Ошибка:</b> Сумма займа ({format_currency(value)}) превышает "
+            f"максимально возможный займ ({format_currency(max_borrow_allowed)}) "
+            f"при Max LTV {max_ltv*100:.0f}%\n\n"
+            "Введите корректную сумму:"
+        )
         return
     
     await state.update_data(borrow=value)
     await calculate_position(msg, state)
 
 
+# =============================================================================
+# CALCULATION
+# =============================================================================
+
 async def calculate_position(msg: types.Message, state: FSMContext):
+    """Финальный расчет"""
     try:
         data = await state.get_data()
+        
+        required = ['supply_ticker', 'borrow_ticker', 'supply_amount', 
+                   'supply_price', 'lt', 'max_ltv', 'mode']
+        if not all(f in data for f in required):
+            await msg.answer("❌ Недостаточно данных. Начните заново с /start")
+            await state.clear()
+            return
         
         supply_amt = data['supply_amount']
         price = data['supply_price']
         lt = data['lt']
         max_ltv = data['max_ltv']
+        mode = data['mode']
         
         collateral = supply_amt * price
         
-        if data['mode'] == "mode_ltv":
-            borrow = collateral * data['ltv']
-            ltv = data['ltv']
+        if mode == "mode_ltv":
+            ltv = data.get('ltv')
+            if ltv is None:
+                await msg.answer("❌ Отсутствует LTV")
+                await state.clear()
+                return
+            borrow = collateral * ltv
         else:
-            borrow = data['borrow']
+            borrow = data.get('borrow')
+            if borrow is None:
+                await msg.answer("❌ Отсутствует сумма займа")
+                await state.clear()
+                return
             ltv = borrow / collateral if collateral > 0 else 0
         
-        hf = calc_hf(collateral, lt, borrow)
-        liq_price = calc_liq_price(borrow, supply_amt, lt)
+        ltv_percent = ltv * 100
+        
+        hf = calculate_health_factor(collateral, lt, borrow)
+        liq_price = calculate_liquidation_price(borrow, supply_amt, lt)
+        max_borrow = collateral * max_ltv
         buffer = ((price - liq_price) / price) * 100 if price > 0 else 0
         
         scenarios = []
         for drop in [10, 20, 30]:
-            new_coll = supply_amt * price * (1 - drop / 100)
-            scenarios.append((drop, calc_hf(new_coll, lt, borrow)))
+            new_price = price * (1 - drop / 100)
+            new_coll = supply_amt * new_price
+            scen_hf = calculate_health_factor(new_coll, lt, borrow)
+            scenarios.append((drop, scen_hf))
         
-        calc = {
+        calculations = {
             'supply_amt': supply_amt,
             'price': price,
             'collateral': collateral,
             'borrow': borrow,
-            'ltv_pct': ltv * 100,
-            'max_ltv_pct': max_ltv * 100,
+            'ltv_percent': ltv_percent,
+            'max_ltv_percent': max_ltv * 100,
             'lt': lt,
             'hf': hf,
             'liq_price': liq_price,
             'buffer': buffer,
-            'max_borrow': collateral * max_ltv,
+            'max_borrow': max_borrow,
             'scenarios': scenarios
         }
         
+        result_message = build_result_message(data, calculations)
+        
         await msg.answer("⏳ Формирую результаты...")
-        await msg.answer(build_result(data, calc))
-        await msg.answer("✅ Расчет завершен!\n\n/start - новый расчет")
+        await msg.answer(result_message)
+        await msg.answer(
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "✅ Расчет завершен!\n\n"
+            "/start - новый расчет"
+        )
         
         await state.clear()
         
     except Exception as e:
-        logger.error(f"Calc error: {e}")
-        await msg.answer(f"❌ Ошибка расчета\n\n/start")
+        await msg.answer(f"❌ Ошибка: {str(e)}\n\nИспользуйте /start")
         await state.clear()
 
 
+# =============================================================================
+# FALLBACK & ERROR HANDLERS
+# =============================================================================
+
 @dp.message()
-async def fallback(msg: types.Message, state: FSMContext):
-    if await state.get_state():
-        await msg.answer("⚠️ Следуйте инструкциям или /reset")
+async def fallback_handler(msg: types.Message, state: FSMContext):
+    """Обработчик неизвестных сообщений"""
+    current_state = await state.get_state()
+    if current_state:
+        await msg.answer("⚠️ Следуйте инструкциям или используйте /reset")
     else:
-        await msg.answer("👋 /start для начала")
+        await msg.answer("👋 Привет! Используйте /start для начала расчета")
 
 
 @dp.error()
-async def error_handler(update: types.Update, exception: Exception):
-    logger.error(f"Update {update.update_id} error: {exception}", exc_info=True)
+async def error_handler(event, exception):
+    """Глобальный обработчик ошибок"""
+    print(f"❌ Ошибка: {exception}")
     return True
 
+
 # =============================================================================
-# STARTUP & MAIN
+# STARTUP & SHUTDOWN
 # =============================================================================
 
 async def on_startup():
-    logger.info("=" * 50)
-    logger.info("🚀 DeFi Calculator Bot Starting")
+    print("\n" + "=" * 70)
+    print("🚀 DeFi Position Calculator Bot v2.2")
+    print("=" * 70)
     
     bot_info = await bot.get_me()
-    logger.info(f"✅ Bot: @{bot_info.username}")
+    print(f"✅ Бот: @{bot_info.username}")
     
-    if cryptorank.is_available():
-        logger.info("✅ CryptoRank API configured")
+    # Проверка CryptoRank
+    if cryptorank_fetcher.is_available():
+        print("✅ CryptoRank API настроен")
     else:
-        logger.info("⚠️  CryptoRank API not configured")
+        print("⚠️  CryptoRank API не настроен (добавьте CRYPTORANK_API_KEY в .env)")
     
-    logger.info("=" * 50)
+    # Проверка CoinGecko
+    test_price = await coingecko_fetcher.get_price_usd("BTC")
+    if test_price:
+        print(f"✅ CoinGecko работает (BTC: ${test_price:,.2f})")
+        print(f"✅ CoinGecko: {len(coingecko_fetcher.get_supported_symbols())} монет")
+    
+    print("=" * 70)
+    print("✅ БОТ ГОТОВ")
+    print("=" * 70 + "\n")
 
 
 async def on_shutdown():
-    await cryptorank.close()
-    await coingecko.close()
+    await cryptorank_fetcher.close()
+    await coingecko_fetcher.close()
     await bot.session.close()
-    logger.info("👋 Bot stopped")
+    print("\n👋 Бот остановлен")
 
 
 async def main():
@@ -707,10 +1034,13 @@ async def main():
         await on_startup()
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     except KeyboardInterrupt:
-        logger.info("Stopping...")
+        print("\n⚠️ Остановка...")
     finally:
         await on_shutdown()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 До свидания!")
