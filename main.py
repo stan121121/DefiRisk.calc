@@ -1,10 +1,9 @@
 import asyncio
 import os
-import json
+import sys
 from datetime import datetime, timedelta
 from typing import Tuple, Optional, Dict
 from collections import deque
-import sys
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
@@ -24,33 +23,38 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("❌ Не установлен токен бота! Установите BOT_TOKEN в переменных окружения")
 
-CRYPTORANK_API_KEY = os.getenv("CRYPTORANK_API_KEY", "")
+COINMARKETCAP_API_KEY = os.getenv("COINMARKETCAP_API_KEY", "")
 
-# Важно: создаем бота с явным указанием session
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-
-# Создаем диспетчер с более надежным storage
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage, fsm_strategy=FSMStrategy.USER_IN_CHAT)
 
 # =============================================================================
-# PRICE FETCHERS
+# COINMARKETCAP PRICE FETCHER
 # =============================================================================
 
-class CryptoRankPriceFetcherV1:
-    """CryptoRank API v1 price fetcher"""
+class CoinMarketCapPriceFetcher:
+    """CoinMarketCap API price fetcher с кэшированием"""
     
-    BASE_URL = "https://api.cryptorank.io/v1"
+    BASE_URL = "https://pro-api.coinmarketcap.com/v1"
     
-    def __init__(self, api_key: str = ""):
+    def __init__(self, api_key: str = "", cache_ttl: int = 300):
         self._api_key = api_key
+        self._cache: Dict[str, Tuple[float, datetime]] = {}
+        self._cache_ttl = timedelta(seconds=cache_ttl)
         self._session: Optional[aiohttp.ClientSession] = None
-        self._stats = {"total": 0, "success": 0, "fail": 0, "errors": []}
+        self._stats = {
+            "total_requests": 0,
+            "success": 0,
+            "fail": 0,
+            "cache_hits": 0,
+            "api_calls": 0
+        }
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=aiohttp.ClientTimeout(total=15)
             )
         return self._session
     
@@ -60,130 +64,6 @@ class CryptoRankPriceFetcherV1:
     
     def is_available(self) -> bool:
         return bool(self._api_key)
-    
-    async def get_price_usd(self, symbol: str) -> Optional[float]:
-        if not self.is_available():
-            return None
-        
-        self._stats["total"] += 1
-        symbol = symbol.upper().strip()
-        
-        try:
-            session = await self._get_session()
-            # Используем v1 endpoint
-            url = f"{self.BASE_URL}/currencies/{symbol}"
-            params = {
-                "api_key": self._api_key,
-                "locale": "en"
-            }
-            
-            async with session.get(url, params=params) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    self._stats["fail"] += 1
-                    self._stats["errors"].append(f"HTTP {resp.status}: {error_text[:100]}")
-                    return None
-                
-                data = await resp.json()
-                
-                # Парсим ответ v1 API
-                if "data" not in data:
-                    self._stats["fail"] += 1
-                    return None
-                
-                currency_data = data["data"]
-                
-                # Пробуем получить цену из разных полей
-                price = None
-                
-                # Способ 1: из fields/priceUSD
-                if "fields" in currency_data and "priceUSD" in currency_data["fields"]:
-                    price = float(currency_data["fields"]["priceUSD"])
-                # Способ 2: из price
-                elif "price" in currency_data:
-                    price = float(currency_data["price"])
-                # Способ 3: из quotes/USD/price
-                elif "quotes" in currency_data and "USD" in currency_data["quotes"]:
-                    price = float(currency_data["quotes"]["USD"]["price"])
-                
-                if price is not None:
-                    self._stats["success"] += 1
-                    return price
-                else:
-                    self._stats["fail"] += 1
-                    return None
-                    
-        except Exception as e:
-            self._stats["fail"] += 1
-            self._stats["errors"].append(str(e))
-            return None
-    
-    def get_stats(self) -> dict:
-        success_rate = (self._stats["success"] / self._stats["total"] * 100) if self._stats["total"] > 0 else 0
-        return {
-            **self._stats,
-            "success_rate": f"{success_rate:.1f}%"
-        }
-
-
-class CoinGeckoPriceFetcher:
-    """Price fetcher с кэшированием и rate limiting"""
-    
-    COINGECKO_IDS = {
-        "ETH": "ethereum",
-        "BTC": "bitcoin",
-        "SOL": "solana",
-        "USDC": "usd-coin",
-        "USDT": "tether",
-        "DAI": "dai",
-        "BUSD": "binance-usd",
-        "BNB": "binancecoin",
-        "ADA": "cardano",
-        "DOT": "polkadot",
-        "AVAX": "avalanche-2",
-        "MATIC": "matic-network",
-        "LINK": "chainlink",
-        "UNI": "uniswap",
-        "ATOM": "cosmos",
-        "XRP": "ripple",
-        "LTC": "litecoin",
-        "DOGE": "dogecoin",
-        "SHIB": "shiba-inu",
-        "AAVE": "aave",
-    }
-    
-    BASE_URL = "https://api.coingecko.com/api/v3"
-    
-    def __init__(self, cache_ttl: int = 300, max_requests_per_minute: int = 5):
-        self._cache: Dict[str, Tuple[float, datetime]] = {}
-        self._cache_ttl = timedelta(seconds=cache_ttl)
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._max_requests_per_minute = max_requests_per_minute
-        self._request_times = deque(maxlen=max_requests_per_minute)
-        self._rate_limit_lock = asyncio.Lock()
-        self._stats = {"total_requests": 0, "cache_hits": 0, "api_calls": 0}
-    
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=15)
-            self._session = aiohttp.ClientSession(timeout=timeout)
-        return self._session
-    
-    async def close(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
-    
-    async def _wait_for_rate_limit(self):
-        async with self._rate_limit_lock:
-            now = datetime.now()
-            while self._request_times and (now - self._request_times[0]).total_seconds() > 60:
-                self._request_times.popleft()
-            if len(self._request_times) >= self._max_requests_per_minute:
-                oldest_request = self._request_times[0]
-                wait_time = 60 - (now - oldest_request).total_seconds()
-                if wait_time > 0:
-                    await asyncio.sleep(wait_time + 0.5)
-            self._request_times.append(now)
     
     def _get_from_cache(self, symbol: str) -> Optional[float]:
         if symbol in self._cache:
@@ -201,60 +81,79 @@ class CoinGeckoPriceFetcher:
             self._stats["cache_hits"] / self._stats["total_requests"] * 100 
             if self._stats["total_requests"] > 0 else 0
         )
-        return {**self._stats, "cache_hit_rate": f"{cache_hit_rate:.1f}%", "cache_size": len(self._cache)}
+        success_rate = (
+            self._stats["success"] / self._stats["total_requests"] * 100 
+            if self._stats["total_requests"] > 0 else 0
+        )
+        return {
+            **self._stats,
+            "cache_hit_rate": f"{cache_hit_rate:.1f}%",
+            "success_rate": f"{success_rate:.1f}%",
+            "cache_size": len(self._cache)
+        }
     
-    async def get_price_usd(self, symbol: str, use_cache: bool = True) -> Optional[float]:
-        symbol = symbol.upper().strip()
-        self._stats["total_requests"] += 1
-        
-        if use_cache:
-            cached_price = self._get_from_cache(symbol)
-            if cached_price is not None:
-                return cached_price
-        
-        if symbol not in self.COINGECKO_IDS:
+    async def get_price_usd(self, symbol: str) -> Optional[float]:
+        if not self.is_available():
             return None
         
-        url = f"{self.BASE_URL}/simple/price"
-        params = {"ids": self.COINGECKO_IDS[symbol], "vs_currencies": "usd"}
+        self._stats["total_requests"] += 1
+        symbol = symbol.upper().strip()
+        
+        # Проверяем кэш
+        cached_price = self._get_from_cache(symbol)
+        if cached_price is not None:
+            return cached_price
         
         try:
-            await self._wait_for_rate_limit()
             session = await self._get_session()
+            url = f"{self.BASE_URL}/cryptocurrency/quotes/latest"
+            headers = {
+                "X-CMC_PRO_API_KEY": self._api_key,
+                "Accept": "application/json"
+            }
+            params = {"symbol": symbol}
+            
             self._stats["api_calls"] += 1
             
-            async with session.get(url, params=params) as response:
-                if response.status == 429:
-                    retry_after = int(response.headers.get('Retry-After', '60'))
-                    await asyncio.sleep(retry_after)
-                    return await self.get_price_usd(symbol, use_cache=False)
-                
-                response.raise_for_status()
-                data = await response.json()
-                
-                coin_id = self.COINGECKO_IDS[symbol]
-                if coin_id not in data or "usd" not in data[coin_id]:
+            async with session.get(url, headers=headers, params=params) as resp:
+                if resp.status == 429:
+                    # Rate limit exceeded
                     return None
                 
-                price = data[coin_id]["usd"]
-                if use_cache:
-                    self._save_to_cache(symbol, price)
-                return price
-        except Exception:
+                if resp.status != 200:
+                    self._stats["fail"] += 1
+                    return None
+                
+                data = await resp.json()
+                
+                if "data" not in data or symbol not in data["data"]:
+                    self._stats["fail"] += 1
+                    return None
+                
+                coin_data = data["data"][symbol]
+                if "quote" not in coin_data or "USD" not in coin_data["quote"]:
+                    self._stats["fail"] += 1
+                    return None
+                
+                price = coin_data["quote"]["USD"]["price"]
+                if price is None:
+                    self._stats["fail"] += 1
+                    return None
+                
+                price_float = float(price)
+                self._stats["success"] += 1
+                
+                # Сохраняем в кэш
+                self._save_to_cache(symbol, price_float)
+                
+                return price_float
+                
+        except Exception as e:
+            self._stats["fail"] += 1
             return None
-    
-    @classmethod
-    def is_supported(cls, symbol: str) -> bool:
-        return symbol.upper().strip() in cls.COINGECKO_IDS
-    
-    @classmethod
-    def get_supported_symbols(cls) -> list:
-        return sorted(cls.COINGECKO_IDS.keys())
 
-
-# Initialize price fetchers
-cryptorank_fetcher = CryptoRankPriceFetcherV1(api_key=CRYPTORANK_API_KEY)
-coingecko_fetcher = CoinGeckoPriceFetcher(cache_ttl=300, max_requests_per_minute=5)
+# Инициализируем fetcher
+cmc_fetcher = CoinMarketCapPriceFetcher(api_key=COINMARKETCAP_API_KEY, cache_ttl=300)
 
 # =============================================================================
 # FSM STATES
@@ -276,34 +175,21 @@ class Calc(StatesGroup):
 # KEYBOARDS
 # =============================================================================
 
-def price_choice_kb(cr_price: Optional[float], cg_price: Optional[float]):
+def price_choice_kb(cmc_price: Optional[float]):
     """Клавиатура выбора источника цены"""
     buttons = []
     
-    if cg_price is not None:
-        if cg_price >= 1:
-            price_str = f"${cg_price:,.2f}"
-        elif cg_price >= 0.01:
-            price_str = f"${cg_price:.4f}"
+    if cmc_price is not None:
+        if cmc_price >= 1:
+            price_str = f"${cmc_price:,.2f}"
+        elif cmc_price >= 0.01:
+            price_str = f"${cmc_price:.4f}"
         else:
-            price_str = f"${cg_price:.8f}"
+            price_str = f"${cmc_price:.8f}"
         
         buttons.append([InlineKeyboardButton(
-            text=f"🦎 CoinGecko: {price_str}",
-            callback_data="price_coingecko"
-        )])
-    
-    if cr_price is not None:
-        if cr_price >= 1:
-            price_str = f"${cr_price:,.2f}"
-        elif cr_price >= 0.01:
-            price_str = f"${cr_price:.4f}"
-        else:
-            price_str = f"${cr_price:.8f}"
-        
-        buttons.append([InlineKeyboardButton(
-            text=f"✅ CryptoRank: {price_str}",
-            callback_data="price_cryptorank"
+            text=f"📊 CoinMarketCap: {price_str}",
+            callback_data="price_cmc"
         )])
     
     buttons.append([InlineKeyboardButton(
@@ -397,8 +283,7 @@ def build_result_message(data: dict, calculations: dict) -> str:
         liq_price_str = f"${liq_price:.8f}"
     
     source_names = {
-        "cryptorank": "CryptoRank",
-        "coingecko": "CoinGecko",
+        "cmc": "CoinMarketCap",
         "manual": "ручной ввод"
     }
     price_display = f"{price_str} ({source_names.get(price_source, 'API')})"
@@ -476,16 +361,14 @@ def build_result_message(data: dict, calculations: dict) -> str:
 async def start_cmd(msg: types.Message, state: FSMContext):
     await state.clear()
     
-    cr_status = "✅" if cryptorank_fetcher.is_available() else "❌"
-    cg_supported = coingecko_fetcher.get_supported_symbols()
+    cmc_status = "✅" if cmc_fetcher.is_available() else "❌"
     
     await msg.answer(
         "🤖 <b>DeFi Position Calculator</b>\n"
         "<i>Калькулятор кредитных позиций в DeFi</i>\n\n"
         
         f"<b>📡 Источники цен:</b>\n"
-        f"{cr_status} CryptoRank API v1\n"
-        f"✅ CoinGecko API ({len(cg_supported)} монет)\n"
+        f"{cmc_status} CoinMarketCap API\n"
         f"✅ Ручной ввод (любые токены)\n\n"
         
         "━━━━━━━━━━━━━━━━━━━━\n"
@@ -506,57 +389,34 @@ async def help_cmd(msg: types.Message):
         "<b>Команды:</b>\n"
         "/start - начать расчет\n"
         "/reset - сбросить расчет\n"
-        "/supported - список монет\n"
         "/stats - статистика API\n\n"
         
         "<b>Порядок ввода:</b>\n"
         "1️⃣ Тикер залога\n"
         "2️⃣ Тикер займа\n"
         "3️⃣ Количество залога\n"
-        "4️⃣ Цена (авто/ручная)\n"
+        "4️⃣ Цена (API/ручная)\n"
         "5️⃣ Maximum LTV\n"
         "6️⃣ Liquidation Threshold\n"
         "7️⃣ Режим расчета\n"
         "8️⃣ LTV или сумма займа"
     )
 
-@dp.message(Command("supported"))
-async def supported_cmd(msg: types.Message):
-    supported = coingecko_fetcher.get_supported_symbols()
-    cols = 4
-    rows = []
-    for i in range(0, len(supported), cols):
-        row = " | ".join(f"<code>{coin}</code>" for coin in supported[i:i+cols])
-        rows.append(row)
-    
-    cr_status = "настроен ✅" if cryptorank_fetcher.is_available() else "не настроен ❌"
-    
-    await msg.answer(
-        f"<b>📡 Источники цен:</b>\n\n"
-        f"<b>CryptoRank API v1:</b> {cr_status}\n"
-        f"(поддерживает большинство токенов)\n\n"
-        f"<b>CoinGecko API ({len(supported)} монет):</b>\n"
-        + "\n".join(rows) + 
-        "\n\n💡 <i>Для остальных - ручной ввод</i>"
-    )
-
 @dp.message(Command("stats"))
 async def stats_cmd(msg: types.Message):
-    cg_stats = coingecko_fetcher.get_stats()
-    cr_stats = cryptorank_fetcher.get_stats()
+    stats = cmc_fetcher.get_stats()
+    cmc_status = "настроен ✅" if cmc_fetcher.is_available() else "не настроен ❌"
     
     await msg.answer(
         f"<b>📊 Статистика API</b>\n\n"
-        f"<b>CoinGecko:</b>\n"
-        f"Запросов: {cg_stats['total_requests']}\n"
-        f"API вызовов: {cg_stats['api_calls']}\n"
-        f"Из кэша: {cg_stats['cache_hits']}\n"
-        f"Процент кэша: {cg_stats['cache_hit_rate']}\n\n"
-        f"<b>CryptoRank v1:</b>\n"
-        f"Запросов: {cr_stats['total']}\n"
-        f"Успешных: {cr_stats['success']}\n"
-        f"Ошибок: {cr_stats['fail']}\n"
-        f"Успешность: {cr_stats.get('success_rate', '0%')}"
+        f"<b>CoinMarketCap:</b> {cmc_status}\n"
+        f"Всего запросов: {stats['total_requests']}\n"
+        f"Успешных: {stats['success']}\n"
+        f"Ошибок: {stats['fail']}\n"
+        f"Успешность: {stats.get('success_rate', '0%')}\n"
+        f"API вызовов: {stats['api_calls']}\n"
+        f"Из кэша: {stats['cache_hits']}\n"
+        f"Процент кэша: {stats.get('cache_hit_rate', '0%')}\n"
     )
 
 # =============================================================================
@@ -571,11 +431,9 @@ async def process_supply_ticker(msg: types.Message, state: FSMContext):
         return
     
     await state.update_data(supply_ticker=ticker)
-    is_supported = coingecko_fetcher.is_supported(ticker)
     
     await msg.answer(
-        f"✅ <b>Залоговый актив:</b> {ticker}\n"
-        f"{'🌐' if is_supported else '✍️'} Цена: {'автоматическая' if is_supported else 'ручной ввод'}\n\n"
+        f"✅ <b>Залоговый актив:</b> {ticker}\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Введите <b>тикер заимствуемого актива</b>"
     )
@@ -609,40 +467,39 @@ async def process_supply_amount(msg: types.Message, state: FSMContext):
     data = await state.get_data()
     ticker = data['supply_ticker']
     
-    await msg.answer(f"✅ Количество: {value:.6f}\n\n⏳ Получаю цены {ticker}...")
+    await msg.answer(f"✅ Количество: {value:.6f}")
     
-    # Параллельный запрос цен
-    cr_task = asyncio.create_task(cryptorank_fetcher.get_price_usd(ticker))
-    cg_task = asyncio.create_task(coingecko_fetcher.get_price_usd(ticker))
-    
-    cr_price, cg_price = await asyncio.gather(cr_task, cg_task)
-    
-    # Если есть хотя бы одна цена - предлагаем выбор
-    if cr_price is not None or cg_price is not None:
-        await state.update_data(cryptorank_price=cr_price, coingecko_price=cg_price)
+    # Пытаемся получить цену из CoinMarketCap
+    if cmc_fetcher.is_available():
+        await msg.answer(f"⏳ Получаю цену {ticker} из CoinMarketCap...")
+        cmc_price = await cmc_fetcher.get_price_usd(ticker)
         
-        sources = []
-        if cg_price:
-            price_str = f"${cg_price:,.2f}" if cg_price >= 1 else f"${cg_price:.6f}"
-            sources.append(f"🦎 CoinGecko: {price_str}")
-        if cr_price:
-            price_str = f"${cr_price:,.2f}" if cr_price >= 1 else f"${cr_price:.6f}"
-            sources.append(f"✅ CryptoRank: {price_str}")
-        
-        await msg.answer(
-            f"💱 <b>Найдены цены {ticker}:</b>\n" +
-            "\n".join(f"• {s}" for s in sources) +
-            "\n\n<b>Выберите источник:</b>",
-            reply_markup=price_choice_kb(cr_price, cg_price)
-        )
-        await state.set_state(Calc.choose_price)
-    else:
-        await msg.answer(
-            f"❌ Цена {ticker} не найдена в API\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"Введите <b>цену {ticker}</b> в USD вручную:"
-        )
-        await state.set_state(Calc.supply_price_manual)
+        if cmc_price is not None:
+            await state.update_data(cmc_price=cmc_price)
+            
+            if cmc_price >= 1:
+                price_str = f"${cmc_price:,.2f}"
+            elif cmc_price >= 0.01:
+                price_str = f"${cmc_price:.4f}"
+            else:
+                price_str = f"${cmc_price:.8f}"
+            
+            await msg.answer(
+                f"💱 <b>Найдена цена {ticker}:</b>\n"
+                f"• 📊 CoinMarketCap: {price_str}\n\n"
+                f"<b>Выберите источник:</b>",
+                reply_markup=price_choice_kb(cmc_price)
+            )
+            await state.set_state(Calc.choose_price)
+            return
+    
+    # Если CoinMarketCap не доступен или не нашел цену
+    await msg.answer(
+        f"❌ Цена {ticker} не найдена в API или API не настроен\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"Введите <b>цену {ticker}</b> в USD вручную:"
+    )
+    await state.set_state(Calc.supply_price_manual)
 
 @dp.callback_query(F.data.startswith("price_"))
 async def process_price_choice(cb: types.CallbackQuery, state: FSMContext):
@@ -658,14 +515,11 @@ async def process_price_choice(cb: types.CallbackQuery, state: FSMContext):
         await state.set_state(Calc.supply_price_manual)
         return
     
-    if choice == "cryptorank":
-        price = data.get('cryptorank_price')
-        source = "cryptorank"
-        source_name = "CryptoRank"
-    else:
-        price = data.get('coingecko_price')
-        source = "coingecko"
-        source_name = "CoinGecko"
+    # Используем CoinMarketCap цену
+    if choice == "cmc":
+        price = data.get('cmc_price')
+        source = "cmc"
+        source_name = "CoinMarketCap"
     
     if price is None:
         await cb.message.edit_text("❌ Ошибка получения цены. Введите вручную:")
@@ -975,29 +829,24 @@ async def on_startup():
     bot_info = await bot.get_me()
     print(f"✅ Бот: @{bot_info.username}")
     
-    # Закрываем предыдущие соединения с Telegram API
+    # Удаляем вебхук для чистого запуска
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         print("✅ Удален вебхук и очищены ожидающие обновления")
     except Exception as e:
         print(f"⚠️ Не удалось удалить вебхук: {e}")
     
-    if cryptorank_fetcher.is_available():
-        print("✅ CryptoRank API v1: настроен")
+    if cmc_fetcher.is_available():
+        print("✅ CoinMarketCap API: настроен")
     else:
-        print("ℹ️  CryptoRank API v1: не настроен (опционально)")
-    
-    test_price = await coingecko_fetcher.get_price_usd("BTC")
-    if test_price:
-        print(f"✅ CoinGecko работает (BTC: ${test_price:,.2f})")
+        print("ℹ️  CoinMarketCap API: не настроен (используйте ручной ввод цен)")
     
     print("=" * 60)
     print("✅ БОТ ГОТОВ")
     print("=" * 60 + "\n")
 
 async def on_shutdown():
-    await cryptorank_fetcher.close()
-    await coingecko_fetcher.close()
+    await cmc_fetcher.close()
     await bot.session.close()
     print("\n👋 Бот остановлен")
 
@@ -1009,7 +858,7 @@ async def main():
     try:
         await on_startup()
         
-        # Настройки для предотвращения конфликтов
+        # Настройки polling для предотвращения конфликтов
         polling_config = {
             "allowed_updates": dp.resolve_used_update_types(),
             "close_timeout": 10,
@@ -1028,26 +877,6 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        # Проверяем, не запущен ли уже бот
-        import psutil
-        current_pid = os.getpid()
-        current_process = psutil.Process(current_pid)
-        
-        # Ищем процессы с таким же именем
-        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-            try:
-                if proc.pid != current_pid and "python" in proc.name().lower():
-                    cmdline = proc.cmdline()
-                    if cmdline and "main.py" in " ".join(cmdline):
-                        print(f"⚠️ Найден другой запущенный процесс бота (PID: {proc.pid})")
-                        print("⚠️ Завершите его перед запуском нового экземпляра")
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n👋 До свидания!")
-    except ImportError:
-        # Если psutil не установлен, просто запускаем бота
-        print("⚠️ psutil не установлен, проверка процессов пропущена")
-        asyncio.run(main())
