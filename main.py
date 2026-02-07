@@ -1,18 +1,13 @@
 """
 =============================================================================
-DeFi Position Calculator Bot - Финальная версия v2.2
+DeFi Position Calculator Bot - Финальная версия v2.3
 =============================================================================
 
-Изменения v2.2:
-✅ Добавлена интеграция CryptoRank API
-✅ Выбор источника цены: CryptoRank / CoinGecko / Ручной ввод
-✅ Приоритет: CryptoRank → CoinGecko → Ручной ввод
-✅ Кнопки для выбора при наличии нескольких источников
-
-Изменения v2.1:
-✅ Новый порядок ввода: Max LTV → LT → режим расчета
-✅ Цена ликвидации учитывает источник цены (ручной/авто)
-✅ В расчете показывается, какая цена была использована
+Изменения v2.3:
+✅ Добавлена отладка для CryptoRank API
+✅ Улучшена обработка ошибок CryptoRank
+✅ Логирование всех API запросов
+✅ Автоматический fallback на CoinGecko при ошибках CryptoRank
 
 =============================================================================
 """
@@ -29,22 +24,23 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.strategy import FSMStrategy
 from typing import Tuple, Optional, Dict
 import aiohttp
+import json
 from datetime import datetime, timedelta
 from collections import deque
 
 # =============================================================================
-# PRICE FETCHERS
+# PRICE FETCHERS - УЛУЧШЕННЫЕ С ОТЛАДКОЙ
 # =============================================================================
 
 class CryptoRankPriceFetcher:
-    """CryptoRank API price fetcher"""
+    """CryptoRank API price fetcher с расширенной отладкой"""
     
     BASE_URL = "https://api.cryptorank.io/v2/currencies"
     
     def __init__(self, api_key: str = ""):
         self._api_key = api_key
         self._session: Optional[aiohttp.ClientSession] = None
-        self._stats = {"total": 0, "success": 0, "fail": 0}
+        self._stats = {"total": 0, "success": 0, "fail": 0, "errors": []}
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -58,42 +54,85 @@ class CryptoRankPriceFetcher:
             await self._session.close()
     
     def is_available(self) -> bool:
-        return bool(self._api_key)
+        available = bool(self._api_key)
+        print(f"🔍 CryptoRank доступен: {available}, ключ: {'есть' if self._api_key else 'нет'}")
+        return available
     
     async def get_price_usd(self, symbol: str) -> Optional[float]:
         if not self.is_available():
+            print(f"❌ CryptoRank не доступен для {symbol}")
             return None
         
         self._stats["total"] += 1
         symbol = symbol.upper().strip()
+        print(f"🔍 Запрос CryptoRank для {symbol}...")
         
         try:
             session = await self._get_session()
+            headers = {"X-Api-Key": self._api_key}
+            params = {"symbols": symbol}
+            
+            print(f"🔍 Запрос к CryptoRank: {self.BASE_URL}")
+            print(f"🔍 Заголовки: { {k: '***' if 'Key' in k else v for k, v in headers.items()} }")
+            print(f"🔍 Параметры: {params}")
+            
             async with session.get(
                 self.BASE_URL,
-                headers={"X-Api-Key": self._api_key},
-                params={"symbols": symbol}
+                headers=headers,
+                params=params
             ) as resp:
+                print(f"🔍 CryptoRank статус: {resp.status}")
+                
                 if resp.status != 200:
+                    error_text = await resp.text()
+                    print(f"❌ CryptoRank ошибка {resp.status}: {error_text[:200]}")
                     self._stats["fail"] += 1
+                    self._stats["errors"].append(f"HTTP {resp.status}: {error_text[:100]}")
                     return None
                 
                 data = await resp.json()
+                print(f"🔍 CryptoRank ответ: {json.dumps(data, indent=2)[:500]}...")
+                
                 items = data.get("data", [])
                 
                 if not items:
+                    print(f"❌ CryptoRank: нет данных для {symbol}")
                     self._stats["fail"] += 1
+                    self._stats["errors"].append(f"No data for {symbol}")
                     return None
                 
-                price = float(items[0]["values"]["USD"]["price"])
-                self._stats["success"] += 1
-                return price
-        except Exception:
+                try:
+                    price = float(items[0]["values"]["USD"]["price"])
+                    print(f"✅ CryptoRank цена для {symbol}: ${price}")
+                    self._stats["success"] += 1
+                    return price
+                except (KeyError, IndexError, TypeError, ValueError) as e:
+                    print(f"❌ CryptoRank: ошибка парсинга для {symbol}: {e}")
+                    print(f"🔍 Структура данных: {items[0].keys() if items else 'нет items'}")
+                    if items and 'values' in items[0]:
+                        print(f"🔍 Доступные валюты: {list(items[0]['values'].keys())}")
+                    self._stats["fail"] += 1
+                    self._stats["errors"].append(f"Parse error for {symbol}: {e}")
+                    return None
+        except aiohttp.ClientError as e:
+            print(f"❌ CryptoRank сетевой ошибка для {symbol}: {e}")
             self._stats["fail"] += 1
+            self._stats["errors"].append(f"Network error: {str(e)}")
+            return None
+        except Exception as e:
+            print(f"❌ CryptoRank неожиданная ошибка для {symbol}: {e}")
+            import traceback
+            traceback.print_exc()
+            self._stats["fail"] += 1
+            self._stats["errors"].append(f"Unexpected error: {str(e)}")
             return None
     
     def get_stats(self) -> dict:
-        return self._stats
+        return {
+            **self._stats,
+            "success_rate": f"{(self._stats['success'] / self._stats['total'] * 100):.1f}%" if self._stats['total'] > 0 else "0%",
+            "recent_errors": self._stats["errors"][-5:] if self._stats["errors"] else []
+        }
 
 
 class CoinGeckoPriceFetcher:
@@ -131,7 +170,7 @@ class CoinGeckoPriceFetcher:
         self._max_requests_per_minute = max_requests_per_minute
         self._request_times = deque(maxlen=max_requests_per_minute)
         self._rate_limit_lock = asyncio.Lock()
-        self._stats = {"total_requests": 0, "cache_hits": 0, "api_calls": 0}
+        self._stats = {"total_requests": 0, "cache_hits": 0, "api_calls": 0, "errors": []}
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -152,6 +191,7 @@ class CoinGeckoPriceFetcher:
                 oldest_request = self._request_times[0]
                 wait_time = 60 - (now - oldest_request).total_seconds()
                 if wait_time > 0:
+                    print(f"⏳ CoinGecko rate limit, жду {wait_time:.1f} секунд")
                     await asyncio.sleep(wait_time + 0.5)
             self._request_times.append(now)
     
@@ -160,6 +200,7 @@ class CoinGeckoPriceFetcher:
             price, timestamp = self._cache[symbol]
             if datetime.now() - timestamp < self._cache_ttl:
                 self._stats["cache_hits"] += 1
+                print(f"📦 CoinGecko кэш для {symbol}: ${price}")
                 return price
         return None
     
@@ -171,10 +212,15 @@ class CoinGeckoPriceFetcher:
             self._stats["cache_hits"] / self._stats["total_requests"] * 100 
             if self._stats["total_requests"] > 0 else 0
         )
-        return {**self._stats, "cache_hit_rate": f"{cache_hit_rate:.1f}%", "cache_size": len(self._cache)}
+        return {
+            **self._stats, 
+            "cache_hit_rate": f"{cache_hit_rate:.1f}%", 
+            "cache_size": len(self._cache)
+        }
     
     async def get_price_usd(self, symbol: str, use_cache: bool = True) -> Optional[float]:
         symbol = symbol.upper().strip()
+        print(f"🔍 Запрос CoinGecko для {symbol}...")
         self._stats["total_requests"] += 1
         
         if use_cache:
@@ -183,6 +229,7 @@ class CoinGeckoPriceFetcher:
                 return cached_price
         
         if symbol not in self.COINGECKO_IDS:
+            print(f"❌ CoinGecko: {symbol} не поддерживается")
             return None
         
         url = f"{self.BASE_URL}/simple/price"
@@ -193,30 +240,40 @@ class CoinGeckoPriceFetcher:
             session = await self._get_session()
             self._stats["api_calls"] += 1
             
+            print(f"🔍 Запрос к CoinGecko: {url} с params={params}")
             async with session.get(url, params=params) as response:
                 if response.status == 429:
                     retry_after = int(response.headers.get('Retry-After', '60'))
+                    print(f"⏳ CoinGecko rate limit, жду {retry_after} секунд")
                     await asyncio.sleep(retry_after)
                     return await self.get_price_usd(symbol, use_cache=False)
                 
+                print(f"🔍 CoinGecko статус: {response.status}")
                 response.raise_for_status()
                 data = await response.json()
                 
                 coin_id = self.COINGECKO_IDS[symbol]
                 if coin_id not in data or "usd" not in data[coin_id]:
+                    print(f"❌ CoinGecko: нет цены для {symbol} ({coin_id})")
+                    print(f"🔍 Ответ: {data}")
                     return None
                 
                 price = data[coin_id]["usd"]
+                print(f"✅ CoinGecko цена для {symbol}: ${price}")
+                
                 if use_cache:
                     self._save_to_cache(symbol, price)
                 return price
         except Exception as e:
             print(f"❌ Ошибка получения цены {symbol}: {e}")
+            self._stats["errors"].append(f"{symbol}: {str(e)}")
             return None
     
     @classmethod
     def is_supported(cls, symbol: str) -> bool:
-        return symbol.upper().strip() in cls.COINGECKO_IDS
+        supported = symbol.upper().strip() in cls.COINGECKO_IDS
+        print(f"🔍 CoinGecko поддерживает {symbol}: {supported}")
+        return supported
     
     @classmethod
     def get_supported_symbols(cls) -> list:
@@ -267,19 +324,7 @@ def price_choice_kb(cr_price: Optional[float], cg_price: Optional[float]):
     """Клавиатура выбора источника цены"""
     buttons = []
     
-    if cr_price is not None:
-        if cr_price >= 1:
-            price_str = f"${cr_price:,.2f}"
-        elif cr_price >= 0.01:
-            price_str = f"${cr_price:.4f}"
-        else:
-            price_str = f"${cr_price:.8f}"
-        
-        buttons.append([InlineKeyboardButton(
-            text=f"✅ CryptoRank: {price_str}",
-            callback_data="price_cryptorank"
-        )])
-    
+    # Сначала CoinGecko (более надежный)
     if cg_price is not None:
         if cg_price >= 1:
             price_str = f"${cg_price:,.2f}"
@@ -291,6 +336,20 @@ def price_choice_kb(cr_price: Optional[float], cg_price: Optional[float]):
         buttons.append([InlineKeyboardButton(
             text=f"🦎 CoinGecko: {price_str}",
             callback_data="price_coingecko"
+        )])
+    
+    # Затем CryptoRank
+    if cr_price is not None:
+        if cr_price >= 1:
+            price_str = f"${cr_price:,.2f}"
+        elif cr_price >= 0.01:
+            price_str = f"${cr_price:.4f}"
+        else:
+            price_str = f"${cr_price:.8f}"
+        
+        buttons.append([InlineKeyboardButton(
+            text=f"✅ CryptoRank: {price_str}",
+            callback_data="price_cryptorank"
         )])
     
     buttons.append([InlineKeyboardButton(
@@ -491,7 +550,7 @@ async def start_cmd(msg: types.Message, state: FSMContext):
     cg_supported = coingecko_fetcher.get_supported_symbols()
     
     await msg.answer(
-        "🤖 <b>DeFi Position Calculator v2.2</b>\n"
+        "🤖 <b>DeFi Position Calculator v2.3</b>\n"
         "<i>Калькулятор кредитных позиций в DeFi</i>\n\n"
         
         f"<b>📡 Источники цен:</b>\n"
@@ -522,7 +581,8 @@ async def help_cmd(msg: types.Message):
         "/start - начать расчет\n"
         "/reset - сбросить расчет\n"
         "/supported - список монет\n"
-        "/stats - статистика API\n\n"
+        "/stats - статистика API\n"
+        "/debug - отладочная информация\n\n"
         
         "<b>Порядок ввода:</b>\n"
         "1️⃣ Тикер залога\n"
@@ -564,7 +624,7 @@ async def stats_cmd(msg: types.Message):
     cg_stats = coingecko_fetcher.get_stats()
     cr_stats = cryptorank_fetcher.get_stats()
     
-    await msg.answer(
+    stats_text = (
         f"<b>📊 Статистика API</b>\n\n"
         f"<b>CoinGecko:</b>\n"
         f"Запросов: {cg_stats['total_requests']}\n"
@@ -574,7 +634,34 @@ async def stats_cmd(msg: types.Message):
         f"<b>CryptoRank:</b>\n"
         f"Запросов: {cr_stats['total']}\n"
         f"Успешных: {cr_stats['success']}\n"
-        f"Ошибок: {cr_stats['fail']}"
+        f"Ошибок: {cr_stats['fail']}\n"
+        f"Успешность: {cr_stats.get('success_rate', '0%')}\n"
+    )
+    
+    if cr_stats.get('recent_errors'):
+        stats_text += f"\n<b>Последние ошибки CryptoRank:</b>\n"
+        for error in cr_stats['recent_errors']:
+            stats_text += f"• {error[:50]}...\n"
+    
+    await msg.answer(stats_text)
+
+
+@dp.message(Command("debug"))
+async def debug_cmd(msg: types.Message):
+    """Отладочная информация"""
+    cr_available = cryptorank_fetcher.is_available()
+    cr_key_preview = "***" + CRYPTORANK_API_KEY[-4:] if CRYPTORANK_API_KEY and len(CRYPTORANK_API_KEY) > 4 else "не установлен"
+    
+    await msg.answer(
+        f"<b>🐛 Отладочная информация</b>\n\n"
+        f"<b>CryptoRank:</b>\n"
+        f"Доступен: {'✅' if cr_available else '❌'}\n"
+        f"Ключ: {cr_key_preview}\n"
+        f"Длина ключа: {len(CRYPTORANK_API_KEY) if CRYPTORANK_API_KEY else 0}\n\n"
+        f"<b>CoinGecko:</b>\n"
+        f"Доступен: ✅\n"
+        f"Поддерживаемых монет: {len(coingecko_fetcher.get_supported_symbols())}\n\n"
+        f"<i>Для теста попробуйте тикер BTC</i>"
     )
 
 
@@ -591,7 +678,6 @@ async def process_supply_ticker(msg: types.Message, state: FSMContext):
         return
     
     await state.update_data(supply_ticker=ticker)
-    # ИСПРАВЛЕНО: заменил price_fetcher на coingecko_fetcher
     is_supported = coingecko_fetcher.is_supported(ticker)
     
     await msg.answer(
@@ -636,29 +722,50 @@ async def process_supply_amount(msg: types.Message, state: FSMContext):
     
     await msg.answer(f"✅ Количество: {value:.6f}\n\n⏳ Получаю цены {ticker}...")
     
-    # Пытаемся получить цены из обоих источников
-    cr_price = await cryptorank_fetcher.get_price_usd(ticker)
-    cg_price = await coingecko_fetcher.get_price_usd(ticker)
+    # Пытаемся получить цены из обоих источников ПАРАЛЛЕЛЬНО
+    print(f"\n{'='*60}")
+    print(f"🔍 ПОЛУЧЕНИЕ ЦЕН ДЛЯ {ticker}")
+    print(f"{'='*60}")
+    
+    # Запускаем оба запроса параллельно
+    cr_task = asyncio.create_task(cryptorank_fetcher.get_price_usd(ticker))
+    cg_task = asyncio.create_task(coingecko_fetcher.get_price_usd(ticker))
+    
+    cr_price, cg_price = await asyncio.gather(cr_task, cg_task)
+    
+    print(f"\n📊 РЕЗУЛЬТАТЫ ДЛЯ {ticker}:")
+    print(f"CryptoRank: ${cr_price if cr_price else 'нет'}")
+    print(f"CoinGecko: ${cg_price if cg_price else 'нет'}")
+    print(f"{'='*60}\n")
     
     # Если есть хотя бы одна цена - предлагаем выбор
     if cr_price is not None or cg_price is not None:
         await state.update_data(cryptorank_price=cr_price, coingecko_price=cg_price)
         
         sources = []
-        if cr_price:
-            price_str = f"${cr_price:,.2f}" if cr_price >= 1 else f"${cr_price:.6f}"
-            sources.append(f"CryptoRank: {price_str}")
         if cg_price:
             price_str = f"${cg_price:,.2f}" if cg_price >= 1 else f"${cg_price:.6f}"
-            sources.append(f"CoinGecko: {price_str}")
+            sources.append(f"🦎 CoinGecko: {price_str}")
+        if cr_price:
+            price_str = f"${cr_price:,.2f}" if cr_price >= 1 else f"${cr_price:.6f}"
+            sources.append(f"✅ CryptoRank: {price_str}")
         
-        await msg.answer(
-            f"💱 <b>Найдены цены {ticker}:</b>\n" +
-            "\n".join(f"• {s}" for s in sources) +
-            "\n\n<b>Выберите источник:</b>",
-            reply_markup=price_choice_kb(cr_price, cg_price)
-        )
-        await state.set_state(Calc.choose_price)
+        if sources:
+            await msg.answer(
+                f"💱 <b>Найдены цены {ticker}:</b>\n" +
+                "\n".join(f"• {s}" for s in sources) +
+                "\n\n<b>Выберите источник:</b>",
+                reply_markup=price_choice_kb(cr_price, cg_price)
+            )
+            await state.set_state(Calc.choose_price)
+        else:
+            # Нет автоматических цен - запрашиваем ручной ввод
+            await msg.answer(
+                f"❌ Цена {ticker} не найдена в API\n\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"Введите <b>цену {ticker}</b> в USD вручную:"
+            )
+            await state.set_state(Calc.supply_price_manual)
     else:
         # Нет автоматических цен - запрашиваем ручной ввод
         await msg.answer(
@@ -1019,11 +1126,12 @@ async def fallback_handler(msg: types.Message, state: FSMContext):
         await msg.answer("👋 Привет! Используйте /start для начала расчета")
 
 
-# ИСПРАВЛЕНО: добавлен второй аргумент exception
 @dp.error()
 async def error_handler(event, exception):
     """Глобальный обработчик ошибок"""
-    print(f"❌ Ошибка: {exception}")
+    print(f"❌ Глобальная ошибка: {exception}")
+    import traceback
+    traceback.print_exc()
     return True
 
 
@@ -1033,7 +1141,7 @@ async def error_handler(event, exception):
 
 async def on_startup():
     print("\n" + "=" * 70)
-    print("🚀 DeFi Position Calculator Bot v2.2")
+    print("🚀 DeFi Position Calculator Bot v2.3")
     print("=" * 70)
     
     bot_info = await bot.get_me()
@@ -1041,7 +1149,16 @@ async def on_startup():
     
     # Проверка CryptoRank
     if cryptorank_fetcher.is_available():
-        print("✅ CryptoRank API: настроен")
+        key_preview = CRYPTORANK_API_KEY[:4] + "..." + CRYPTORANK_API_KEY[-4:] if len(CRYPTORANK_API_KEY) > 8 else "***"
+        print(f"✅ CryptoRank API: настроен (ключ: {key_preview})")
+        
+        # Тестовый запрос для проверки
+        print(f"🔍 Тестовый запрос CryptoRank для BTC...")
+        test_price = await cryptorank_fetcher.get_price_usd("BTC")
+        if test_price:
+            print(f"✅ CryptoRank работает (BTC: ${test_price:,.2f})")
+        else:
+            print(f"❌ CryptoRank тестовый запрос не удался")
     else:
         print("ℹ️  CryptoRank API: не настроен (опционально)")
     
@@ -1050,6 +1167,8 @@ async def on_startup():
     if test_price:
         print(f"✅ CoinGecko работает (BTC: ${test_price:,.2f})")
         print(f"✅ CoinGecko: {len(coingecko_fetcher.get_supported_symbols())} монет")
+    else:
+        print(f"❌ CoinGecko тестовый запрос не удался")
     
     print("✅ Новый порядок: Max LTV → LT → режим расчета")
     print("=" * 70)
