@@ -364,7 +364,7 @@ async def start_cmd(msg: types.Message, state: FSMContext):
     cmc_status = "✅" if cmc_fetcher.is_available() else "❌"
     
     await msg.answer(
-        "🤖 <b>DeFi Position Calculator</b>\n"
+        "🤖 <b>DeFi Risk.calc</b>\n"
         "<i>Калькулятор кредитных позиций в DeFi</i>\n\n"
         
         f"<b>📡 Источники цен:</b>\n"
@@ -880,3 +880,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n👋 До свидания!")
+
