@@ -21,7 +21,7 @@ import aiohttp
 
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
-    raise ValueError("❌ Не установлен токен бота! Установите BOT_TOKEN в переменных окружения")
+    raise ValueError("❌ Bot token not set! Set BOT_TOKEN in environment variables")
 
 COINMARKETCAP_API_KEY = os.getenv("COINMARKETCAP_API_KEY", "")
 
@@ -34,7 +34,7 @@ dp = Dispatcher(storage=storage, fsm_strategy=FSMStrategy.USER_IN_CHAT)
 # =============================================================================
 
 class CoinMarketCapPriceFetcher:
-    """CoinMarketCap API price fetcher с кэшированием"""
+    """CoinMarketCap API price fetcher with caching"""
     
     BASE_URL = "https://pro-api.coinmarketcap.com/v1"
     
@@ -99,7 +99,7 @@ class CoinMarketCapPriceFetcher:
         self._stats["total_requests"] += 1
         symbol = symbol.upper().strip()
         
-        # Проверяем кэш
+        # Check cache
         cached_price = self._get_from_cache(symbol)
         if cached_price is not None:
             return cached_price
@@ -143,7 +143,7 @@ class CoinMarketCapPriceFetcher:
                 price_float = float(price)
                 self._stats["success"] += 1
                 
-                # Сохраняем в кэш
+                # Save to cache
                 self._save_to_cache(symbol, price_float)
                 
                 return price_float
@@ -152,7 +152,7 @@ class CoinMarketCapPriceFetcher:
             self._stats["fail"] += 1
             return None
 
-# Инициализируем fetcher
+# Initialize fetcher
 cmc_fetcher = CoinMarketCapPriceFetcher(api_key=COINMARKETCAP_API_KEY, cache_ttl=300)
 
 # =============================================================================
@@ -176,7 +176,7 @@ class Calc(StatesGroup):
 # =============================================================================
 
 def price_choice_kb(cmc_price: Optional[float]):
-    """Клавиатура выбора источника цены"""
+    """Price source selection keyboard"""
     buttons = []
     
     if cmc_price is not None:
@@ -193,15 +193,15 @@ def price_choice_kb(cmc_price: Optional[float]):
         )])
     
     buttons.append([InlineKeyboardButton(
-        text="✏️ Ввести вручную",
+        text="✏️ Enter manually",
         callback_data="price_manual"
     )])
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 mode_kb = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="🔢 По LTV", callback_data="mode_ltv")],
-    [InlineKeyboardButton(text="💵 По сумме займа", callback_data="mode_borrow")]
+    [InlineKeyboardButton(text="🔢 By LTV", callback_data="mode_ltv")],
+    [InlineKeyboardButton(text="💵 By borrow amount", callback_data="mode_borrow")]
 ])
 
 # =============================================================================
@@ -213,19 +213,19 @@ def validate_number(text: str, min_val: float = 0, max_val: Optional[float] = No
         text = text.replace(",", ".").strip()
         value = float(text)
         if value <= min_val:
-            return False, 0, f"Значение должно быть больше {min_val}"
+            return False, 0, f"Value must be greater than {min_val}"
         if max_val is not None and value > max_val:
-            return False, 0, f"Значение должно быть не больше {max_val}"
+            return False, 0, f"Value must not exceed {max_val}"
         return True, value, ""
     except (ValueError, TypeError):
-        return False, 0, "Пожалуйста, введите корректное число"
+        return False, 0, "Please enter a valid number"
 
 def validate_ticker(text: str, max_length: int = 10) -> Tuple[bool, str, str]:
     ticker = text.upper().strip()
     if len(ticker) > max_length:
-        return False, "", f"Тикер слишком длинный (максимум {max_length} символов)"
+        return False, "", f"Ticker is too long (max {max_length} characters)"
     if not ticker.isalnum():
-        return False, "", "Тикер должен содержать только буквы и цифры"
+        return False, "", "Ticker must contain only letters and numbers"
     return True, ticker, ""
 
 def format_currency(value: float) -> str:
@@ -254,18 +254,20 @@ def calculate_liquidation_price(borrow: float, supply_amount: float, lt: float) 
 
 def get_position_status(hf: float) -> Tuple[str, str]:
     if hf <= 1.0:
-        return "🔴 ЛИКВИДАЦИЯ", "🔴"
+        return "🔴 LIQUIDATION", "🔴"
     elif hf < 1.3:
-        return "🟡 ВНИМАНИЕ", "🟡"
+        return "🟡 WARNING", "🟡"
     elif hf < 2.0:
-        return "🟢 БЕЗОПАСНО", "🟢"
+        return "🟢 SAFE", "🟢"
     else:
-        return "🔵 ОЧЕНЬ БЕЗОПАСНО", "🔵"
+        return "🔵 VERY SAFE", "🔵"
 
 def build_result_message(data: dict, calculations: dict) -> str:
+    """Build final result message"""
     status, emoji = get_position_status(calculations['hf'])
     price_source = data.get('supply_price_source', 'manual')
     
+    # Smart price formatting (more digits for small prices)
     price = calculations['price']
     if price >= 1:
         price_str = f"${price:,.2f}"
@@ -274,6 +276,7 @@ def build_result_message(data: dict, calculations: dict) -> str:
     else:
         price_str = f"${price:.8f}"
     
+    # Similarly for liquidation price
     liq_price = calculations['liq_price']
     if liq_price >= 1:
         liq_price_str = f"${liq_price:,.2f}"
@@ -282,52 +285,55 @@ def build_result_message(data: dict, calculations: dict) -> str:
     else:
         liq_price_str = f"${liq_price:.8f}"
     
+    # Determine how to show price
     source_names = {
         "cmc": "CoinMarketCap",
-        "manual": "ручной ввод"
+        "manual": "manual input"
     }
     price_display = f"{price_str} ({source_names.get(price_source, 'API')})"
     
     result = (
-        f"<b>{emoji} РАСЧЕТ ПОЗИЦИИ</b>\n"
-        f"Статус: <b>{status}</b>\n\n"
+        f"<b>{emoji} POSITION CALCULATION</b>\n"
+        f"Status: <b>{status}</b>\n\n"
         
-        f"<b>💎 ЗАЛОГ:</b>\n"
-        f"• Актив: <b>{data['supply_ticker']}</b>\n"
-        f"• Количество: {calculations['supply_amt']:.6f}\n"
-        f"• Цена: {price_display}\n"
-        f"• Стоимость: <b>{format_currency(calculations['collateral'])}</b>\n\n"
+        f"<b>💎 Supply:</b>\n"
+        f"• Asset: <b>{data['supply_ticker']}</b>\n"
+        f"• Amount: {calculations['supply_amt']:.6f}\n"
+        f"• Price: {price_display}\n"
+        f"• Value: <b>{format_currency(calculations['collateral'])}</b>\n\n"
         
-        f"<b>💰 ЗАЙМ:</b>\n"
-        f"• Актив: <b>{data['borrow_ticker']}</b>\n"
-        f"• Сумма: <b>{format_currency(calculations['borrow'])}</b>\n\n"
+        f"<b>💰 BORROW:</b>\n"
+        f"• Asset: <b>{data['borrow_ticker']}</b>\n"
+        f"• Amount: <b>{format_currency(calculations['borrow'])}</b>\n\n"
         
-        f"<b>⚙️ ПАРАМЕТРЫ:</b>\n"
+        f"<b>⚙️ PARAMETERS:</b>\n"
         f"• Maximum LTV: {calculations['max_ltv_percent']}%\n"
         f"• Liquidation Threshold: {calculations['lt']*100:.1f}%\n"
         f"• Current LTV: <b>{calculations['ltv_percent']:.2f}%</b>\n\n"
         
-        f"<b>📊 РИСКИ:</b>\n"
+        f"<b>📊 RISKS:</b>\n"
         f"• Health Factor: <b>{format_number(calculations['hf'], 2)}</b>\n"
     )
     
+    # Liquidation price with price source indication
     if price_source == "manual":
         result += (
-            f"• Цена ликвидации: <b>{liq_price_str}</b>\n"
-            f"  <i>(при ручной цене залога {price_str})</i>\n"
+            f"• Liquidation price: <b>{liq_price_str}</b>\n"
+            f"  <i>(with manual collateral price {price_str})</i>\n"
         )
     else:
-        result += f"• Цена ликвидации: <b>{liq_price_str}</b>\n"
+        result += f"• Liquidation price: <b>{liq_price_str}</b>\n"
     
     result += (
-        f"• Буфер безопасности: <b>{calculations['buffer']:.1f}%</b>\n"
-        f"• Макс. возможный займ: {format_currency(calculations['max_borrow'])}\n\n"
+        f"• Safety buffer: <b>{calculations['buffer']:.1f}%</b>\n"
+        f"• Max possible borrow: {format_currency(calculations['max_borrow'])}\n\n"
         
-        f"<b>📉 СЦЕНАРИИ (падение цены):</b>\n"
+        f"<b>📉 SCENARIOS (price drop):</b>\n"
     )
     
     for drop, scen_hf in calculations['scenarios']:
         new_price = calculations['price'] * (1 - drop / 100)
+        # Smart formatting for scenario prices
         if new_price >= 1:
             new_price_str = f"${new_price:,.2f}"
         elif new_price >= 0.01:
@@ -336,19 +342,21 @@ def build_result_message(data: dict, calculations: dict) -> str:
             new_price_str = f"${new_price:.8f}"
         result += f"• -{drop}% ({new_price_str}) → HF: {format_number(scen_hf, 2)}\n"
     
+    # Recommendations
     if calculations['hf'] < 1.3:
         result += (
-            "\n<b>⚠️ РЕКОМЕНДАЦИИ:</b>\n"
-            "• Увеличьте залог для повышения HF\n"
-            "• Уменьшите сумму займа\n"
-            "• Подготовьте средства для пополнения\n"
-            "• Установите алерты на изменение цены"
+            "\n<b>⚠️ RECOMMENDATIONS:</b>\n"
+            "• Increase collateral to raise HF\n"
+            "• Reduce borrow amount\n"
+            "• Prepare funds for replenishment\n"
+            "• Set price change alerts"
         )
     
+    # Manual input notification
     if price_source == "manual":
         result += (
-            f"\n\n💡 <i>Цена {data['supply_ticker']} введена вручную. "
-            f"При следующем расчете потребуется ввести заново.</i>"
+            f"\n\n💡 <i>{data['supply_ticker']} price entered manually. "
+            f"Will need to be re-entered in next calculation.</i>"
         )
     
     return result
@@ -364,59 +372,59 @@ async def start_cmd(msg: types.Message, state: FSMContext):
     cmc_status = "✅" if cmc_fetcher.is_available() else "❌"
     
     await msg.answer(
-        "🤖 <b>DeFi Risk.calc</b>\n"
-        "<i>Калькулятор кредитных позиций в DeFi</i>\n\n"
+        "🤖 <b>DeFi Position Calculator</b>\n"
+        "<i>DeFi lending position calculator</i>\n\n"
         
-        f"<b>📡 Источники цен:</b>\n"
+        f"<b>📡 Price sources:</b>\n"
         f"{cmc_status} CoinMarketCap API\n"
-        f"✅ Ручной ввод (любые токены)\n\n"
+        f"✅ Manual input (any tokens)\n\n"
         
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Введите <b>тикер Supply актива</b>\n"
-        "(например: ETH, BTC, SOL)"
+        "Enter <b>collateral asset ticker</b>\n"
+        "(e.g., ETH, BTC, SOL)"
     )
     await state.set_state(Calc.supply_ticker)
 
 @dp.message(Command("reset", "cancel"))
 async def reset_cmd(msg: types.Message, state: FSMContext):
     await state.clear()
-    await msg.answer("✅ Расчет сброшен. Используйте /start для нового расчета")
+    await msg.answer("✅ Calculation reset. Use /start for new calculation")
 
 @dp.message(Command("help"))
 async def help_cmd(msg: types.Message):
     await msg.answer(
-        "<b>📖 Справка</b>\n\n"
-        "<b>Команды:</b>\n"
-        "/start - начать расчет\n"
-        "/reset - сбросить расчет\n"
-        "/stats - статистика API\n\n"
+        "<b>📖 Help</b>\n\n"
+        "<b>Commands:</b>\n"
+        "/start - start calculation\n"
+        "/reset - reset calculation\n"
+        "/stats - API statistics\n\n"
         
-        "<b>Порядок ввода:</b>\n"
-        "1️⃣ Тикер залога\n"
-        "2️⃣ Тикер займа\n"
-        "3️⃣ Количество залога\n"
-        "4️⃣ Цена (API/ручная)\n"
+        "<b>Input order:</b>\n"
+        "1️⃣ Collateral ticker\n"
+        "2️⃣ Borrow ticker\n"
+        "3️⃣ Collateral amount\n"
+        "4️⃣ Price (API/manual)\n"
         "5️⃣ Maximum LTV\n"
         "6️⃣ Liquidation Threshold\n"
-        "7️⃣ Режим расчета\n"
-        "8️⃣ LTV или сумма займа"
+        "7️⃣ Calculation mode\n"
+        "8️⃣ LTV or borrow amount"
     )
 
 @dp.message(Command("stats"))
 async def stats_cmd(msg: types.Message):
     stats = cmc_fetcher.get_stats()
-    cmc_status = "настроен ✅" if cmc_fetcher.is_available() else "не настроен ❌"
+    cmc_status = "configured ✅" if cmc_fetcher.is_available() else "not configured ❌"
     
     await msg.answer(
-        f"<b>📊 Статистика API</b>\n\n"
+        f"<b>📊 API Statistics</b>\n\n"
         f"<b>CoinMarketCap:</b> {cmc_status}\n"
-        f"Всего запросов: {stats['total_requests']}\n"
-        f"Успешных: {stats['success']}\n"
-        f"Ошибок: {stats['fail']}\n"
-        f"Успешность: {stats.get('success_rate', '0%')}\n"
-        f"API вызовов: {stats['api_calls']}\n"
-        f"Из кэша: {stats['cache_hits']}\n"
-        f"Процент кэша: {stats.get('cache_hit_rate', '0%')}\n"
+        f"Total requests: {stats['total_requests']}\n"
+        f"Successful: {stats['success']}\n"
+        f"Failed: {stats['fail']}\n"
+        f"Success rate: {stats.get('success_rate', '0%')}\n"
+        f"API calls: {stats['api_calls']}\n"
+        f"From cache: {stats['cache_hits']}\n"
+        f"Cache hit rate: {stats.get('cache_hit_rate', '0%')}\n"
     )
 
 # =============================================================================
@@ -425,54 +433,56 @@ async def stats_cmd(msg: types.Message):
 
 @dp.message(Calc.supply_ticker)
 async def process_supply_ticker(msg: types.Message, state: FSMContext):
+    """Collateral ticker"""
     valid, ticker, error = validate_ticker(msg.text)
     if not valid:
-        await msg.answer(f"❌ {error}\n\nВведите корректный тикер:")
+        await msg.answer(f"❌ {error}\n\nEnter valid ticker:")
         return
     
     await state.update_data(supply_ticker=ticker)
     
     await msg.answer(
-        f"✅ <b>Supply актив:</b> {ticker}\n\n"
+        f"✅ <b>Collateral asset:</b> {ticker}\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Введите <b>тикер Borrow актива</b>\n"
-        "(например: USDC, USDT, PYUSD)"
+        "Enter <b>borrow asset ticker</b>"
     )
     await state.set_state(Calc.borrow_ticker)
 
 @dp.message(Calc.borrow_ticker)
 async def process_borrow_ticker(msg: types.Message, state: FSMContext):
+    """Borrow ticker"""
     valid, ticker, error = validate_ticker(msg.text)
     if not valid:
-        await msg.answer(f"❌ {error}\n\nВведите корректный тикер:")
+        await msg.answer(f"❌ {error}\n\nEnter valid ticker:")
         return
     
     await state.update_data(borrow_ticker=ticker)
     data = await state.get_data()
     
     await msg.answer(
-        f"✅ <b>Borrow актив:</b> {ticker}\n\n"
+        f"✅ <b>Borrow asset:</b> {ticker}\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"Введите <b>количество {data['supply_ticker']}</b>"
+        f"Enter <b>amount of {data['supply_ticker']}</b>"
     )
     await state.set_state(Calc.supply_amount)
 
 @dp.message(Calc.supply_amount)
 async def process_supply_amount(msg: types.Message, state: FSMContext):
+    """Collateral amount"""
     valid, value, error = validate_number(msg.text, min_val=0.000001)
     if not valid:
-        await msg.answer(f"❌ {error}\n\nВведите количество:")
+        await msg.answer(f"❌ {error}\n\nEnter amount:")
         return
     
     await state.update_data(supply_amount=value)
     data = await state.get_data()
     ticker = data['supply_ticker']
     
-    await msg.answer(f"✅ Количество: {value:.6f}")
+    await msg.answer(f"✅ Amount: {value:.6f}")
     
-    # Пытаемся получить цену из CoinMarketCap
+    # Try to get price from CoinMarketCap
     if cmc_fetcher.is_available():
-        await msg.answer(f"⏳ Получаю цену {ticker} из CoinMarketCap...")
+        await msg.answer(f"⏳ Getting {ticker} price from CoinMarketCap...")
         cmc_price = await cmc_fetcher.get_price_usd(ticker)
         
         if cmc_price is not None:
@@ -486,24 +496,25 @@ async def process_supply_amount(msg: types.Message, state: FSMContext):
                 price_str = f"${cmc_price:.8f}"
             
             await msg.answer(
-                f"💱 <b>Найдена цена {ticker}:</b>\n"
+                f"💱 <b>Found {ticker} prices:</b>\n"
                 f"• 📊 CoinMarketCap: {price_str}\n\n"
-                f"<b>Выберите источник:</b>",
+                f"<b>Choose source:</b>",
                 reply_markup=price_choice_kb(cmc_price)
             )
             await state.set_state(Calc.choose_price)
             return
     
-    # Если CoinMarketCap не доступен или не нашел цену
+    # If CoinMarketCap not available or no price found
     await msg.answer(
-        f"❌ Цена {ticker} не найдена в API или API не настроен\n\n"
+        f"❌ {ticker} price not found in API or API not configured\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"Введите <b>цену {ticker}</b> в USD вручную:"
+        f"Enter <b>{ticker} price</b> in USD manually:"
     )
     await state.set_state(Calc.supply_price_manual)
 
 @dp.callback_query(F.data.startswith("price_"))
 async def process_price_choice(cb: types.CallbackQuery, state: FSMContext):
+    """Price source selection handler"""
     await cb.answer()
     
     data = await state.get_data()
@@ -511,19 +522,19 @@ async def process_price_choice(cb: types.CallbackQuery, state: FSMContext):
     
     if choice == "manual":
         await cb.message.edit_text(
-            f"✏️ Введите цену <b>{data['supply_ticker']}</b> в USD вручную:"
+            f"✏️ Enter <b>{data['supply_ticker']}</b> price in USD manually:"
         )
         await state.set_state(Calc.supply_price_manual)
         return
     
-    # Используем CoinMarketCap цену
+    # Use CoinMarketCap price
     if choice == "cmc":
         price = data.get('cmc_price')
         source = "cmc"
         source_name = "CoinMarketCap"
     
     if price is None:
-        await cb.message.edit_text("❌ Ошибка получения цены. Введите вручную:")
+        await cb.message.edit_text("❌ Error getting price. Enter manually:")
         await state.set_state(Calc.supply_price_manual)
         return
     
@@ -542,19 +553,20 @@ async def process_price_choice(cb: types.CallbackQuery, state: FSMContext):
         price_str = f"${price:.8f}"
     
     await cb.message.edit_text(
-        f"✅ Цена ({source_name}): <b>{price_str}</b>\n"
-        f"💰 Стоимость залога: <b>{format_currency(collateral_value)}</b>\n\n"
+        f"✅ Price ({source_name}): <b>{price_str}</b>\n"
+        f"💰 Collateral value: <b>{format_currency(collateral_value)}</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Введите <b>Maximum LTV</b> в %\n"
-        "(например: 65)"
+        "Enter <b>Maximum LTV</b> in %\n"
+        "(e.g., 65)"
     )
     await state.set_state(Calc.max_ltv)
 
 @dp.message(Calc.supply_price_manual)
 async def process_supply_price_manual(msg: types.Message, state: FSMContext):
+    """Manual price input"""
     valid, price, error = validate_number(msg.text, min_val=0.000001)
     if not valid:
-        await msg.answer(f"❌ {error}\n\nВведите цену:")
+        await msg.answer(f"❌ {error}\n\nEnter price:")
         return
     
     data = await state.get_data()
@@ -574,19 +586,20 @@ async def process_supply_price_manual(msg: types.Message, state: FSMContext):
         price_str = f"${price:.8f}"
     
     await msg.answer(
-        f"✅ Цена (ручной ввод): <b>{price_str}</b>\n"
-        f"💰 Стоимость залога: <b>{format_currency(collateral_value)}</b>\n\n"
+        f"✅ Price (manual): <b>{price_str}</b>\n"
+        f"💰 Collateral value: <b>{format_currency(collateral_value)}</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Введите <b>Maximum LTV</b> в %\n"
-        "(например: 65)"
+        "Enter <b>Maximum LTV</b> in %\n"
+        "(e.g., 65)"
     )
     await state.set_state(Calc.max_ltv)
 
 @dp.message(Calc.max_ltv)
 async def process_max_ltv(msg: types.Message, state: FSMContext):
+    """Maximum LTV - FIRST parameter"""
     valid, value, error = validate_number(msg.text, min_val=0, max_val=100)
     if not valid:
-        await msg.answer(f"❌ {error}\n\nMax LTV должен быть 0-100%. Введите:")
+        await msg.answer(f"❌ {error}\n\nMax LTV must be 0-100%. Enter:")
         return
     
     await state.update_data(max_ltv=value / 100)
@@ -599,28 +612,30 @@ async def process_max_ltv(msg: types.Message, state: FSMContext):
     
     await msg.answer(
         f"✅ <b>Maximum LTV: {value}%</b>\n"
-        f"💰 Макс. возможный займ: <b>{format_currency(max_possible_borrow)}</b>\n\n"
+        f"💰 Max possible borrow: <b>{format_currency(max_possible_borrow)}</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Введите <b>Liquidation Threshold (LT)</b> в %\n"
-        "(например: 75)"
+        "Enter <b>Liquidation Threshold (LT)</b> in %\n"
+        "(e.g., 75)"
     )
     await state.set_state(Calc.lt)
 
 @dp.message(Calc.lt)
 async def process_lt(msg: types.Message, state: FSMContext):
+    """Liquidation Threshold - SECOND parameter"""
     valid, value, error = validate_number(msg.text, min_val=0, max_val=100)
     if not valid:
-        await msg.answer(f"❌ {error}\n\nLT должен быть 0-100%. Введите:")
+        await msg.answer(f"❌ {error}\n\nLT must be 0-100%. Enter:")
         return
     
     data = await state.get_data()
     max_ltv = data.get('max_ltv', 0) * 100
     
+    # Check: LT must be >= Max LTV
     if value < max_ltv:
         await msg.answer(
-            f"❌ <b>Ошибка:</b> Liquidation Threshold ({value}%) должен быть "
-            f"больше или равен Maximum LTV ({max_ltv:.0f}%)\n\n"
-            "Введите корректное значение LT:"
+            f"❌ <b>Error:</b> Liquidation Threshold ({value}%) must be "
+            f"greater than or equal to Maximum LTV ({max_ltv:.0f}%)\n\n"
+            "Enter correct LT value:"
         )
         return
     
@@ -629,13 +644,14 @@ async def process_lt(msg: types.Message, state: FSMContext):
     await msg.answer(
         f"✅ <b>Liquidation Threshold: {value}%</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Выберите <b>режим расчета</b>:",
+        "Choose <b>calculation mode</b>:",
         reply_markup=mode_kb
     )
     await state.set_state(Calc.mode)
 
 @dp.callback_query(F.data.startswith("mode_"))
 async def process_mode(cb: types.CallbackQuery, state: FSMContext):
+    """Calculation mode - THIRD choice"""
     await cb.answer()
     mode = cb.data
     data = await state.get_data()
@@ -649,43 +665,46 @@ async def process_mode(cb: types.CallbackQuery, state: FSMContext):
     
     if mode == "mode_ltv":
         await cb.message.edit_text(
-            f"<b>🔢 Режим: Расчет по LTV</b>\n\n"
-            f"Стоимость залога: {format_currency(collateral_value)}\n"
+            f"<b>🔢 Mode: Calculate by LTV</b>\n\n"
+            f"Collateral value: {format_currency(collateral_value)}\n"
             f"Maximum LTV: {max_ltv * 100:.0f}%\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "Введите <b>LTV</b> в %\n"
-            "(например: 50)"
+            "Enter <b>LTV</b> in %\n"
+            "(e.g., 50)"
         )
         await state.set_state(Calc.ltv)
     else:
+        # Calculate maximum possible borrow amount
         max_possible_borrow = collateral_value * max_ltv
         
         await cb.message.edit_text(
-            f"<b>💵 Режим: Расчет по сумме займа</b>\n\n"
-            f"Стоимость залога: {format_currency(collateral_value)}\n"
+            f"<b>💵 Mode: Calculate by borrow amount</b>\n\n"
+            f"Collateral value: {format_currency(collateral_value)}\n"
             f"Maximum LTV: {max_ltv * 100:.0f}%\n"
-            f"<b>Макс. возможный займ: {format_currency(max_possible_borrow)}</b>\n\n"
+            f"<b>Max possible borrow: {format_currency(max_possible_borrow)}</b>\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "Введите <b>сумму займа</b> в USD\n"
-            f"(максимум: {format_currency(max_possible_borrow)})"
+            "Enter <b>borrow amount</b> in USD\n"
+            f"(maximum: {format_currency(max_possible_borrow)})"
         )
         await state.set_state(Calc.borrow)
 
 @dp.message(Calc.ltv)
 async def process_ltv(msg: types.Message, state: FSMContext):
+    """LTV for calculation"""
     valid, value, error = validate_number(msg.text, min_val=0, max_val=100)
     if not valid:
-        await msg.answer(f"❌ {error}\n\nLTV должен быть 0-100%. Введите:")
+        await msg.answer(f"❌ {error}\n\nLTV must be 0-100%. Enter:")
         return
     
     data = await state.get_data()
     max_ltv = data.get('max_ltv', 0) * 100
     
+    # Check: LTV must be <= Max LTV
     if value > max_ltv:
         await msg.answer(
-            f"❌ <b>Ошибка:</b> LTV ({value}%) не может превышать "
+            f"❌ <b>Error:</b> LTV ({value}%) cannot exceed "
             f"Maximum LTV ({max_ltv:.0f}%)\n\n"
-            "Введите корректное значение:"
+            "Enter correct value:"
         )
         return
     
@@ -694,9 +713,10 @@ async def process_ltv(msg: types.Message, state: FSMContext):
 
 @dp.message(Calc.borrow)
 async def process_borrow(msg: types.Message, state: FSMContext):
+    """Borrow amount"""
     valid, value, error = validate_number(msg.text, min_val=0)
     if not valid:
-        await msg.answer(f"❌ {error}\n\nВведите сумму:")
+        await msg.answer(f"❌ {error}\n\nEnter amount:")
         return
     
     data = await state.get_data()
@@ -706,12 +726,13 @@ async def process_borrow(msg: types.Message, state: FSMContext):
     max_ltv = data.get('max_ltv', 0)
     max_borrow_allowed = collateral_value * max_ltv
     
+    # Check: borrow cannot exceed maximum possible
     if value > max_borrow_allowed:
         await msg.answer(
-            f"❌ <b>Ошибка:</b> Сумма займа ({format_currency(value)}) превышает "
-            f"максимально возможный займ ({format_currency(max_borrow_allowed)}) "
-            f"при Max LTV {max_ltv*100:.0f}%\n\n"
-            "Введите корректную сумму:"
+            f"❌ <b>Error:</b> Borrow amount ({format_currency(value)}) exceeds "
+            f"maximum possible borrow ({format_currency(max_borrow_allowed)}) "
+            f"with Max LTV {max_ltv*100:.0f}%\n\n"
+            "Enter correct amount:"
         )
         return
     
@@ -723,13 +744,15 @@ async def process_borrow(msg: types.Message, state: FSMContext):
 # =============================================================================
 
 async def calculate_position(msg: types.Message, state: FSMContext):
+    """Final calculation"""
     try:
         data = await state.get_data()
         
+        # Data validation
         required = ['supply_ticker', 'borrow_ticker', 'supply_amount', 
                    'supply_price', 'lt', 'max_ltv', 'mode']
         if not all(f in data for f in required):
-            await msg.answer("❌ Недостаточно данных. Начните заново с /start")
+            await msg.answer("❌ Insufficient data. Start over with /start")
             await state.clear()
             return
         
@@ -741,28 +764,31 @@ async def calculate_position(msg: types.Message, state: FSMContext):
         
         collateral = supply_amt * price
         
+        # Calculate borrow and LTV
         if mode == "mode_ltv":
             ltv = data.get('ltv')
             if ltv is None:
-                await msg.answer("❌ Отсутствует LTV")
+                await msg.answer("❌ LTV missing")
                 await state.clear()
                 return
             borrow = collateral * ltv
         else:
             borrow = data.get('borrow')
             if borrow is None:
-                await msg.answer("❌ Отсутствует сумма займа")
+                await msg.answer("❌ Borrow amount missing")
                 await state.clear()
                 return
             ltv = borrow / collateral if collateral > 0 else 0
         
         ltv_percent = ltv * 100
         
+        # Calculations
         hf = calculate_health_factor(collateral, lt, borrow)
         liq_price = calculate_liquidation_price(borrow, supply_amt, lt)
         max_borrow = collateral * max_ltv
         buffer = ((price - liq_price) / price) * 100 if price > 0 else 0
         
+        # Scenarios
         scenarios = []
         for drop in [10, 20, 30]:
             new_price = price * (1 - drop / 100)
@@ -770,6 +796,7 @@ async def calculate_position(msg: types.Message, state: FSMContext):
             scen_hf = calculate_health_factor(new_coll, lt, borrow)
             scenarios.append((drop, scen_hf))
         
+        # Collect results
         calculations = {
             'supply_amt': supply_amt,
             'price': price,
@@ -785,20 +812,21 @@ async def calculate_position(msg: types.Message, state: FSMContext):
             'scenarios': scenarios
         }
         
+        # Send result
         result_message = build_result_message(data, calculations)
         
-        await msg.answer("⏳ Формирую результаты...")
+        await msg.answer("⏳ Generating results...")
         await msg.answer(result_message)
         await msg.answer(
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "✅ Расчет завершен!\n\n"
-            "/start - новый расчет"
+            "✅ Calculation complete!\n\n"
+            "/start - new calculation"
         )
         
         await state.clear()
         
     except Exception as e:
-        await msg.answer(f"❌ Ошибка: {str(e)}\n\nИспользуйте /start")
+        await msg.answer(f"❌ Error: {str(e)}\n\nUse /start")
         await state.clear()
 
 # =============================================================================
@@ -807,15 +835,17 @@ async def calculate_position(msg: types.Message, state: FSMContext):
 
 @dp.message()
 async def fallback_handler(msg: types.Message, state: FSMContext):
+    """Unknown messages handler"""
     current_state = await state.get_state()
     if current_state:
-        await msg.answer("⚠️ Следуйте инструкциям или используйте /reset")
+        await msg.answer("⚠️ Follow instructions or use /reset")
     else:
-        await msg.answer("👋 Привет! Используйте /start для начала расчета")
+        await msg.answer("👋 Hello! Use /start to begin calculation")
 
 @dp.error()
 async def error_handler(event, exception):
-    print(f"❌ Ошибка: {exception}")
+    """Global error handler"""
+    print(f"❌ Error: {exception}")
     return True
 
 # =============================================================================
@@ -828,28 +858,28 @@ async def on_startup():
     print("=" * 60)
     
     bot_info = await bot.get_me()
-    print(f"✅ Бот: @{bot_info.username}")
+    print(f"✅ Bot: @{bot_info.username}")
     
-    # Удаляем вебхук для чистого запуска
+    # Remove webhook for clean start
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        print("✅ Удален вебхук и очищены ожидающие обновления")
+        print("✅ Webhook deleted and pending updates cleared")
     except Exception as e:
-        print(f"⚠️ Не удалось удалить вебхук: {e}")
+        print(f"⚠️ Failed to delete webhook: {e}")
     
     if cmc_fetcher.is_available():
-        print("✅ CoinMarketCap API: настроен")
+        print("✅ CoinMarketCap API: configured")
     else:
-        print("ℹ️  CoinMarketCap API: не настроен (используйте ручной ввод цен)")
+        print("ℹ️ CoinMarketCap API: not configured (use manual price input)")
     
     print("=" * 60)
-    print("✅ БОТ ГОТОВ")
+    print("✅ BOT READY")
     print("=" * 60 + "\n")
 
 async def on_shutdown():
     await cmc_fetcher.close()
     await bot.session.close()
-    print("\n👋 Бот остановлен")
+    print("\n👋 Bot stopped")
 
 # =============================================================================
 # MAIN
@@ -859,7 +889,7 @@ async def main():
     try:
         await on_startup()
         
-        # Настройки polling для предотвращения конфликтов
+        # Polling settings to prevent conflicts
         polling_config = {
             "allowed_updates": dp.resolve_used_update_types(),
             "close_timeout": 10,
@@ -868,9 +898,9 @@ async def main():
         
         await dp.start_polling(bot, **polling_config)
     except KeyboardInterrupt:
-        print("\n⚠️ Остановка...")
+        print("\n⚠️ Stopping...")
     except Exception as e:
-        print(f"❌ Критическая ошибка: {e}")
+        print(f"❌ Critical error: {e}")
         import traceback
         traceback.print_exc()
     finally:
@@ -880,4 +910,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 До свидания!")
+        print("\n👋 Goodbye!")
